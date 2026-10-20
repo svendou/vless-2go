@@ -2,6 +2,8 @@
 
 一个脚本同时部署 **Cloudflare 中转、Hysteria 2（Hy2）直连、VLESS REALITY 直连备用**，并生成一个共用订阅地址。
 
+**Hy2 为可选组件**：默认自动尝试安装；下载、证书生成、配置、启动失败或 UDP 端口被其他服务占用时，会跳过 Hy2，继续保留 Cloudflare、REALITY 和订阅服务。订阅只包含成功启用的节点，Hy2 不会反复重启；下次“安装 / 更新”会重新尝试。
+
 Windows、iPhone、Mac 使用同一个订阅地址，更新订阅后选择想使用的节点即可。菜单支持 **↑ / ↓ 选择、Enter 确认、q 退出**。
 
 更新日期：2026-10-20。本说明对应支持 Cloudflare HTTPS 订阅、节点用途后缀及 CentOS 7/8、Stream 8/9/10 的新版脚本。
@@ -154,7 +156,7 @@ https://自动生成的域名.trycloudflare.com/自动生成的随机访问密�
 3. 新增订阅，将 URL 粘贴到订阅地址栏并保存。
 4. 执行“更新订阅”，再选择节点连接。
 
-订阅包含三个节点，名称根据服务器国家自动识别。例如新加坡服务器：
+全部成功时订阅包含三个节点；Hy2 被跳过时只有 CF、REALITY 两个。名称根据服务器国家自动识别。例如新加坡服务器：
 
 ```text
 SG-CF-主力             Cloudflare 中转，日常优先选择
@@ -225,15 +227,15 @@ sh /opt/deploy-personal-vpn.sh stop
 sh /opt/deploy-personal-vpn.sh help
 ```
 
-四个服务会开机自启。Cloudflare Quick Tunnel 临时域名变化后，需在服务器查看并替换客户端的 HTTPS 订阅 URL。HTTP 直连备用 URL 保持不变；启动时还未获得 Cloudflare 域名，直连订阅会先显示两个直连节点。
+已成功安装的服务会开机自启，跳过的 Hy2 不会自启。Cloudflare Quick Tunnel 临时域名变化后，需在服务器查看并替换客户端的 HTTPS 订阅 URL。HTTP 直连备用 URL 保持不变；启动时还未获得 Cloudflare 域名，直连订阅只显示已启用的直连节点。
 
 ## 8. 更新脚本和已部署服务
 
 将新版脚本上传至 GitHub 后，重新执行“一键下载并运行”的命令，选择“安装 / 更新”即可。本地和服务器文件不会自动同步至 GitHub。
 
-更新时会保留本脚本已有的 VLESS 账号、Hy2 密码、证书和订阅访问密钥。只要公网地址及订阅公网端口不变，HTTP 直连备用 URL 就保持不变；HTTPS URL 随临时隧道域名变化。
+更新时会保留本脚本已有的 VLESS 账号、Hy2 密码、兼容的有效证书和订阅访问密钥；旧的显式曲线参数证书会重新生成并更新指纹。只要公网地址及订阅公网端口不变，HTTP 直连备用 URL 就保持不变；HTTPS URL 随临时隧道域名变化。
 
-脚本只更新它自己管理的安装；遇到其他服务占用端口时会停止安装，避免覆盖。安装阶段失败会尝试恢复本脚本管理的文件。
+脚本只更新它自己管理的安装。其他服务占用必需的 TCP 端口时停止安装；占用 Hy2 的 UDP 端口时只跳过 Hy2。Cloudflare、REALITY 或订阅等必需步骤失败仍会回滚，Hy2 单独失败不会回滚其他组件。
 
 ## 9. 不使用菜单直接安装
 
@@ -287,6 +289,14 @@ SSH、防火墙和其他手动部署的服务不会被删除。自行复制的�
 
 ## 12. 常见问题
 
+### CentOS 安装在生成证书时失败，日志只有 No entries
+
+旧版脚本第 796 行使用 `openssl req -addext` 生成 Hy2 证书。CentOS 7 常见的 OpenSSL 1.0.2 不支持 `-addext`，会在服务启动前退出，因此 systemd 日志可能显示 `No entries`。
+
+本版已改用兼容旧版 OpenSSL 的证书配置文件，并保留生成证书时的 OpenSSL 版本和具体错误。把新版脚本上传覆盖服务器 `/opt/deploy-personal-vpn.sh`，执行 `sh /opt/deploy-personal-vpn.sh`，选择“安装 / 更新”重试即可，无需先卸载或删除原配置。
+
+已有完整、有效的证书及私钥会继续保留。若仍失败，请查看本次输出的 `/var/tmp/personal-vpn-stack-failure.*.log`，其中会包含证书生成步骤的具体报错。
+
 ### CentOS 的 SELinux 要关闭吗
 
 不需要手动关闭。检测到 SELinux 已开启时，脚本会安装所需管理工具，为本脚本的 Xray、cloudflared、Hy2 程序设置持久化执行标签，并在更新、失败回滚及卸载时管理自己的标签规则。遇到同路径的已有自定义规则冲突会停止并提示。
@@ -332,6 +342,10 @@ systemctl status personal-vpn-stack-subscription --no-pager
 
 检查是否开放了 **UDP 43526**，而不只是 TCP。NAT 公网端口与内部端口不同时，需要在安装时填写正确的 Hy2 公网端口。还需确认客户端支持 Hy2 和证书指纹校验。
 
+若安装提示“Hy2 已跳过”，订阅中不包含 Hy2 属于预期行为。独立失败日志保存在 `/var/tmp/personal-vpn-stack-hy2-failure.*.log`；端口占用会直接显示警告。修正问题后再次选择“安装 / 更新”即可重试。
+
+CentOS 7 出现 `tls: x509: invalid ECDSA parameters` 时，新版使用 `ec_param_enc:named_curve` 并替换旧的显式曲线证书；即使 Hy2 仍失败，也会保留另外两个节点。
+
 ### 只出现两个节点，或者 Cloudflare 节点失效
 
 隧道可能尚未生成临时域名，或已重新连接。先查看状态，必要时重建隧道，再将输出的新 HTTPS URL 替换进客户端订阅：
@@ -343,6 +357,14 @@ sh /opt/deploy-personal-vpn.sh restart-tunnel
 ### 提示 `Another stack command is running`
 
 先确认另一个终端是否正在安装、更新或卸载，等待其结束。旧版本出现过后台进程继承锁的问题，本仓库新版已修复。若刚从旧版升级仍有占锁问题，需要先确认并处理旧进程；不要直接删除锁文件来绕过检查。
+
+### CentOS 提示 `setpriv: failed to parse reuid`
+
+旧版脚本将用户名传给 `setpriv --reuid/--regid`，CentOS 7 的旧版工具只接受数字 ID，导致服务尚未启动就退出。新版在生成四个服务配置前解析独立账号的数字 UID/GID，systemd 和 Alpine/OpenRC 均使用数字参数，继续保持低权限运行。
+
+将本版 `deploy-personal-vpn.sh` 覆盖服务器 `/opt/deploy-personal-vpn.sh` 后，执行 `sh /opt/deploy-personal-vpn.sh`，选择“安装 / 更新”。已有受管理安装会保留账号配置；更新可能使临时隧道域名变化，完成后重新查看订阅地址。若从 GitHub 下载，需先将本版脚本上传到仓库。
+
+此错误导致的隧道超时不代表 DNS 或 7844 端口一定有问题；应先解决服务启动错误。
 
 ### Alpine 提示服务启动失败
 
@@ -362,6 +384,10 @@ Cloudflare 和 Hy2 走的路线不同，可以分别测试。中转和更换协�
 
 已通过 Bash 语法、系统识别、CentOS 7/8/Stream 8 归档源生成与签名校验选项、dnf/yum/apt/apk 依赖安装分支、SELinux 标签管理的隔离检查，以及现有节点配置、订阅、卸载和失败回滚检查。
 
-Python 3.6.8 实际运行订阅服务，通过订阅下载和两路并发 4 MiB 双向 WebSocket 转发测试；并核对了 CentOS 7 官方 util-linux 包包含脚本所需的 setpriv 选项。
+证书生成已去掉旧版 OpenSSL 不支持的 `-addext`，通过域名扩展、证书用途、密钥匹配、重复更新保留证书，以及生成失败时保存诊断的检查。
+
+新增命名曲线生成与旧显式曲线证书修复检查，以及 systemd/OpenRC 下 Hy2 独立失败的安装流程检查；订阅服务通过动态移除 Hy2 后继续返回两个节点的验证。CentOS 实机仍需重新安装验收。
+
+Python 3.6.8 实际运行订阅服务，通过订阅下载和两路并发 4 MiB 双向 WebSocket 转发测试。四个服务在 systemd 和 OpenRC 下均通过数字 UID/GID 参数生成及旧版数字解析行为模拟检查；包含更新时重新解析账号 ID，以及账号不存在、非数字或 root ID 时拒绝生成服务配置的检查。
 
 此前已在 Debian 和 Alpine 服务器运行基础服务。CentOS 7/8/Stream 和 Ubuntu 尚未完成整机安装验收；归档源可用不代表所有服务器环境均已验证。
