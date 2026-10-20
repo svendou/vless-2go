@@ -4,7 +4,7 @@
 
 Windows、iPhone、Mac 使用同一个订阅地址，更新订阅后选择想使用的节点即可。菜单支持 **↑ / ↓ 选择、Enter 确认、q 退出**。
 
-更新日期：2026-10-20。本说明对应支持 Cloudflare HTTPS 订阅、节点用途后缀及 CentOS Stream 9/10 的新版脚本。
+更新日期：2026-10-20。本说明对应支持 Cloudflare HTTPS 订阅、节点用途后缀及 CentOS 7/8、Stream 8/9/10 的新版脚本。
 
 - [脚本页面](https://github.com/svendou/vless-2go/blob/main/deploy-personal-vpn.sh)
 - [脚本下载地址](https://raw.githubusercontent.com/svendou/vless-2go/main/deploy-personal-vpn.sh)
@@ -15,14 +15,16 @@ Windows、iPhone、Mac 使用同一个订阅地址，更新订阅后选择想使
 |---|---|---|
 | Ubuntu | 20.04 及以上，推荐 22.04 / 24.04 / 26.04 LTS | systemd / apt |
 | Debian | 11 及以上 | systemd / apt |
-| CentOS Stream | 9 / 10 | systemd / dnf，兼容 yum 命令 |
+| CentOS Linux 7 | 使用官方 7.9.2009 归档安装依赖 | systemd / yum |
+| CentOS Linux 8 | 使用官方 8.5.2111 归档安装依赖 | systemd / dnf，兼容 yum 命令 |
+| CentOS Stream | 8 / 9 / 10；Stream 8 使用对应归档 | systemd / dnf，兼容 yum 命令 |
 | Rocky Linux / AlmaLinux / RHEL | 9 及以上，使用相应系统的可用软件源 | systemd / dnf |
 | Alpine Linux | 推荐 3.21 及以上 | OpenRC / apk；缺少 Bash 时自动安装 |
 
 - 支持 amd64 / x86_64、arm64 / aarch64。
 - 使用 root 运行，服务器需要能访问 GitHub 下载组件，并能连接 Cloudflare。
-- 订阅服务需要 Python 3.8 及以上，脚本自动安装系统提供的 Python 3 并检查版本。
-- CentOS 7/8 不在本版支持范围内。普通 Docker / chroot 环境如果没有正常运行的 systemd 或 OpenRC，也不能直接部署这些服务。
+- 订阅服务需要 Python 3.6 及以上，脚本自动安装系统提供的 Python 3 并检查版本。CentOS 7/8 的 Python 3.6 已增加订阅与 WebSocket 服务兼容，不会替换系统 Python 2。
+- 普通 Docker / chroot 环境如果没有正常运行的 systemd 或 OpenRC，不能直接部署这些服务。
 
 不需要提前准备域名或 Cloudflare 账号。普通公网服务器和配置了端口映射的 NAT 服务器均可使用。
 
@@ -56,6 +58,18 @@ if ! command -v curl >/dev/null 2>&1; then dnf install -y curl; fi
 ```
 
 已经提供 `curl` 命令的精简系统可以直接使用它，包括 `curl-minimal`，无需替换。
+
+**CentOS 7/8、CentOS Stream 8：**
+
+已有 `curl` 时可直接使用上面的一键下载命令。原软件源失效、无法安装下载工具时，可先从电脑上传新版 `deploy-personal-vpn.sh` 到服务器 `/opt`，再执行：
+
+```sh
+sh /opt/deploy-personal-vpn.sh
+```
+
+安装过程会临时使用官方 CentOS Vault 归档源，**不改写 `/etc/yum.repos.d/` 中的原有文件**，并保留 HTTPS 证书和 RPM 签名校验。CentOS 7 使用 7.9.2009 归档，CentOS Linux 8 使用 8.5.2111，Stream 8 使用 8-stream。
+
+需要系统原有的 CentOS RPM 签名密钥。若密钥丢失，脚本会停止并提示恢复对应发行版的 release 包密钥，不会跳过验证。CentOS 7 若没有 jq，脚本从 jq 官方下载固定版本，校验 SHA-256 后安装至 `/usr/local/bin/jq`；与系统包依赖一样，卸载节点服务时会保留它。
 
 菜单需要交互输入，请使用上面的“下载到文件后运行”方式，不要改成 `curl ... | sh`。
 
@@ -346,6 +360,8 @@ Cloudflare 和 Hy2 走的路线不同，可以分别测试。中转和更换协�
 
 ## 13. 本版兼容性验证范围
 
-已通过 Bash 语法、系统识别、dnf/yum/apt/apk 依赖安装分支、SELinux 标签管理的隔离检查，以及现有节点配置、订阅、卸载和失败回滚检查。
+已通过 Bash 语法、系统识别、CentOS 7/8/Stream 8 归档源生成与签名校验选项、dnf/yum/apt/apk 依赖安装分支、SELinux 标签管理的隔离检查，以及现有节点配置、订阅、卸载和失败回滚检查。
 
-此前已在 Debian 和 Alpine 服务器运行基础服务。本次新增 CentOS 适配，以及 Ubuntu 的依赖流程，尚未在 CentOS / Ubuntu 实机完成安装验收。
+Python 3.6.8 实际运行订阅服务，通过订阅下载和两路并发 4 MiB 双向 WebSocket 转发测试；并核对了 CentOS 7 官方 util-linux 包包含脚本所需的 setpriv 选项。
+
+此前已在 Debian 和 Alpine 服务器运行基础服务。CentOS 7/8/Stream 和 Ubuntu 尚未完成整机安装验收；归档源可用不代表所有服务器环境均已验证。
