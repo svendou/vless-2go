@@ -6,7 +6,7 @@
 
 Windows、iPhone、Mac 使用同一个订阅地址，更新订阅后选择想使用的节点即可。菜单支持 **↑ / ↓ 选择、Enter 确认、q 退出**。
 
-更新日期：2026-10-22。本说明对应支持 Cloudflare HTTPS 订阅、Telegram MTProto（TCP 53528）、节点用途后缀及 CentOS 7/8、Stream 8/9/10 的新版脚本。
+更新日期：2026-10-22。本说明对应支持 Cloudflare HTTPS 订阅、Telegram MTProto（TCP 53528）、“地区-连接方式”节点命名及 CentOS 7/8、Stream 8/9/10 的新版脚本。
 
 - [脚本页面](https://github.com/svendou/vless-2go/blob/main/deploy-personal-vpn.sh)
 - [脚本下载地址](https://raw.githubusercontent.com/svendou/vless-2go/main/deploy-personal-vpn.sh)
@@ -185,12 +185,12 @@ https://自动生成的域名.trycloudflare.com/自动生成的随机访问密�
 全部成功时订阅包含三个节点；Hy2 被跳过时只有 CF、REALITY 两个。名称根据服务器国家自动识别。例如新加坡服务器：
 
 ```text
-SG-CF-主力             Cloudflare 中转，日常优先选择
-SG-Hy2-备用            Hysteria 2 直连，主力不可用时尝试
-SG-REALITY-不建议使用   VLESS REALITY 直连，保留用于测试
+SG-CF       Cloudflare 中转，日常优先选择
+SG-Hy2      Hysteria 2 直连，主力不可用时尝试
+SG-REALITY  VLESS REALITY 直连，保留用于测试
 ```
 
-美国、日本服务器分别使用 `US-`、`JP-` 前缀，用途后缀相同。识别失败时使用服务器地址作为前缀。所有设备可以使用同一个订阅、同一个账号。主力、备用等后缀用于区分用途，客户端不会仅凭名称自动切换节点。
+美国、日本服务器分别使用 `US-`、`JP-` 前缀，名称统一采用“地区-连接方式”，不附加中文用途后缀。识别失败时使用服务器地址作为前缀。所有设备可以使用同一个订阅、同一个账号。客户端不会仅凭名称自动切换节点。
 
 客户端需要同时支持 VLESS、Hysteria 2 和 Base64 节点订阅。例如支持相应协议的 v2rayN、Hiddify、Shadowrocket 版本；使用 v2rayN 时还需选用支持 Hy2 的核心。**本订阅不是 Clash/Mihomo YAML 配置，不能直接当作 YAML 配置文件导入。**
 
@@ -279,7 +279,7 @@ chmod +x deploy-personal-vpn.sh
 1. 主菜单选择“更改 CF 入口”。
 2. 用 ↑ / ↓ 从 `cdns.doon.eu.org`、`cf.090227.xyz`、`cloudflare-ip.mofashi.ltd`、`saas.sin.fan` 中选择，Enter 保存。
 3. 在 v2rayN、Shadowrocket 等客户端更新该订阅。
-4. 选择更新后的 `SG-CF-主力`（其他地区前缀不同），断开后重新连接。
+4. 选择更新后的 `SG-CF`（其他地区前缀不同），断开后重新连接。
 
 四项均使用 443 端口，当前入口会有标记；按 q 或选择“返回主菜单”取消。
 
@@ -318,6 +318,38 @@ sh /opt/deploy-personal-vpn.sh help
 已成功安装的服务会开机自启，包含单独启用的 MTProto；跳过的 Hy2 不会自启。`stop` 会一并停止 MTProto，并保留配置和 Secret。Cloudflare Quick Tunnel 临时域名变化后，需在服务器查看并替换客户端的 HTTPS 订阅 URL。HTTP 直连备用 URL 保持不变；启动时还未获得 Cloudflare 域名，直连订阅只显示已启用的直连节点。
 
 ## 9. 更新脚本和已部署服务
+
+### 已部署服务器：仅去掉节点名的中文后缀
+
+旧版节点名称为 `SG-CF-主力`、`SG-Hy2-备用`、`SG-REALITY-不建议使用`，新版统一为 `SG-CF`、`SG-Hy2`、`SG-REALITY`，其他地区使用各自前缀。
+
+仅修改名称无需重新部署。以 root 登录 Linux 服务器，执行以下命令，同时修改服务器保存的部署脚本和正在使用的订阅程序：
+
+```sh
+# 去掉节点名称中的中文后缀
+sed -i \
+  -e 's/-CF-主力/-CF/g' \
+  -e 's/-Hy2-备用/-Hy2/g' \
+  -e 's/-REALITY-不建议使用/-REALITY/g' \
+  /opt/deploy-personal-vpn.sh \
+  /usr/local/lib/personal-vpn-stack/subscription.py &&
+{
+  # 重启订阅服务，使新名称生效
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service personal-vpn-stack-subscription restart
+  else
+    systemctl restart personal-vpn-stack-subscription.service
+  fi &&
+  # 更新导出的节点文件和二维码
+  sh /opt/deploy-personal-vpn.sh export
+}
+```
+
+完成后，在手机或电脑客户端点击“更新订阅”，再选择新名称的节点。以上操作不修改账号、端口、订阅地址或 Cloudflare 隧道，只重启订阅服务；Hy2 未启用时仍只显示 CF 和 REALITY。
+
+部署脚本保存在其他位置时，请将命令中的 `/opt/deploy-personal-vpn.sh` 替换为实际路径。此操作只修改服务器文件；从 GitHub 重新下载前，应确认仓库中的脚本也已去掉中文后缀，避免被旧版覆盖。
+
+### 更新完整脚本和服务
 
 将新版脚本上传至 GitHub 后，重新执行“一键下载并运行”的命令，选择“安装 / 更新”即可。本地和服务器文件不会自动同步至 GitHub。
 
