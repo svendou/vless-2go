@@ -17,6 +17,7 @@ umask 077
 
 ETC_DIR=/etc/personal-vpn-stack
 BIN_DIR=/usr/local/lib/personal-vpn-stack
+MT_PROTECT_SCRIPT=$BIN_DIR/mtproto-firewall.sh
 DATA_DIR=/var/lib/personal-vpn-stack
 VPN_UNIT=personal-vpn-stack.service
 CF_UNIT=personal-vpn-stack-cloudflare.service
@@ -53,6 +54,8 @@ MT_WAS_ACTIVE=0
 MT_WAS_ENABLED=0
 MT_SELINUX_ADDED=0
 MT_FILES=()
+MT_PROTECT_RATE=25
+MT_PROTECT_BURST=100
 MANAGED_FILES=()
 PREVIOUS_ENABLED_UNITS=()
 SCRIPT_PATH=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")
@@ -83,6 +86,8 @@ usage() {
   restart-tunnel   重建临时隧道并导出新域名。
 Telegram 代理：
   mtproto          安装 / 更新 Telegram MTProto 代理。
+  mtproto-protect  安装 / 更新 MTProto 新连接限速防护。
+  mtproto-unprotect 移除本脚本安装的 MTProto 限速防护。
   mtproto-info     查看 MTProto 密钥和 Telegram 链接。
   time-sync        配置 Chrony 校时；失败时启用 MTProto 时间容差。
 服务与诊断：
@@ -222,11 +227,12 @@ interactive_menu() {
           *) continue ;;
         esac ;;
       2)
-        arrow_menu 'Telegram 代理' "$footer" 0 '安装 / 更新 MTProto' '查看 MTProto 连接信息' '配置 Chrony 自动校时' '返回' || continue
+        arrow_menu 'Telegram 代理' "$footer" 0 '安装 / 更新 MTProto' '查看 MTProto 连接信息' '安装 / 配置 MTProto 防护' '配置 Chrony 自动校时' '返回' || continue
         case $MENU_SELECTION in
           0) menu_args=(mtproto) ;;
           1) menu_args=(mtproto-info) ;;
-          2) menu_args=(time-sync) ;;
+          2) menu_args=(mtproto-protect) ;;
+          3) menu_args=(time-sync) ;;
           *) continue ;;
         esac ;;
       3)
@@ -1789,6 +1795,10 @@ uninstall_stack() {
   printf '\n将卸载本脚本的 Cloudflare、REALITY、Hy2、MTProto 和订阅服务，删除程序、账号配置及默认目录中的节点文件。\nSSH、防火墙及手工部署的旧服务不受影响。\n'
   read -r -p '确认卸载？输入 y 继续 [N]：' answer || return 0
   [[ $answer == y || $answer == Y ]] || { say '已取消卸载。'; return 0; }
+  if [[ -e "$MT_PROTECT_SCRIPT" ]]; then
+    [[ -x "$MT_PROTECT_SCRIPT" ]] || die 'MTProto 防护脚本不可执行，已停止卸载以避免遗留防火墙规则。'
+    "$MT_PROTECT_SCRIPT" remove || die '无法移除 MTProto 防护规则，已停止卸载以避免遗留防火墙规则。'
+  fi
   if [[ -f "$ETC_DIR/mtproto-selinux-fcontext" ]]; then
     [[ $(cat "$ETC_DIR/mtproto-selinux-fcontext") == "$BIN_DIR/mtg" ]] || die "Unexpected MTProto SELinux rule."
     semanage fcontext -d "$BIN_DIR/mtg"
@@ -1888,6 +1898,62 @@ render_mtproto_config() {
   } > "$2"
 }
 
+render_mtproto_firewall() {
+  local port=$1 destination=$2
+  [[ $port =~ ^[0-9]+$ ]] || die 'Invalid MTProto port for firewall protection.'
+  cat > "$destination" <<SCRIPT
+#!/bin/sh
+set -eu
+
+PORT=$port
+RATE=$MT_PROTECT_RATE
+BURST=$MT_PROTECT_BURST
+CHAIN=PERSONAL_MTPROTO
+
+iptables_bin() {
+  command -v iptables
+}
+
+remove_jump() {
+  while "\$1" -C INPUT -p tcp --dport "\$PORT" --syn -j "\$CHAIN" >/dev/null 2>&1; do
+    "\$1" -D INPUT -p tcp --dport "\$PORT" --syn -j "\$CHAIN"
+  done
+}
+
+apply() {
+  iptables=\$(iptables_bin) || { echo 'iptables is unavailable.' >&2; exit 1; }
+  "\$iptables" -N "\$CHAIN" >/dev/null 2>&1 || true
+  remove_jump "\$iptables" || true
+  "\$iptables" -F "\$CHAIN"
+  "\$iptables" -I INPUT 1 -p tcp --dport "\$PORT" --syn -j "\$CHAIN"
+  "\$iptables" -A "\$CHAIN" -m limit --limit "\$RATE/second" --limit-burst "\$BURST" -j RETURN
+  "\$iptables" -A "\$CHAIN" -j DROP
+}
+
+remove() {
+  iptables=\$(iptables_bin) || exit 0
+  remove_jump "\$iptables" || true
+  if "\$iptables" -L "\$CHAIN" -n >/dev/null 2>&1; then
+    "\$iptables" -F "\$CHAIN" || true
+    "\$iptables" -X "\$CHAIN" || true
+  fi
+}
+
+status() {
+  iptables=\$(iptables_bin) || { echo '未找到 iptables'; exit 1; }
+  "\$iptables" -S "\$CHAIN" 2>/dev/null || echo 'MTProto 限速规则未启用。'
+}
+
+case \${1:-apply} in
+  apply) apply ;;
+  remove) remove ;;
+  status) status ;;
+  *) echo '用法：mtproto-firewall.sh {apply|remove|status}' >&2; exit 2 ;;
+esac
+SCRIPT
+  chmod 0750 "$destination"
+}
+
 render_mtproto_unit() {
   resolve_service_identity
   if [[ $INIT_SYSTEM == openrc ]]; then
@@ -1913,8 +1979,11 @@ start_pre() {
   chown root:$SERVICE_USER "$RUN_DIR/mtproto.log"
   chmod 0640 "$RUN_DIR/mtproto.log"
   ulimit -n 16384 2>/dev/null || true
-}
 UNIT
+    if [[ -x "$MT_PROTECT_SCRIPT" ]]; then
+      printf '  %s apply || true\n' "$MT_PROTECT_SCRIPT" >> "$(service_file "$MT_UNIT")"
+    fi
+    printf '}\n' >> "$(service_file "$MT_UNIT")"
     chmod 0755 "$(service_file "$MT_UNIT")"
   else
     cat > "$(service_file "$MT_UNIT")" <<UNIT
@@ -1927,6 +1996,7 @@ Type=simple
 Environment=GOMEMLIMIT=64MiB
 Environment=GOGC=75
 Environment=GOMAXPROCS=2
+$(if [[ -x "$MT_PROTECT_SCRIPT" ]]; then printf 'ExecStartPre=-%s apply\n' "$MT_PROTECT_SCRIPT"; fi)
 ExecStart=$(command -v setpriv) --reuid=$SERVICE_UID --regid=$SERVICE_GID --clear-groups --bounding-set=-all --no-new-privs $BIN_DIR/mtg run $ETC_DIR/mtproto.toml
 Restart=on-failure
 RestartSec=5
@@ -2005,13 +2075,34 @@ show_mtproto() {
     "此入口为 MTProto 直连，不经过 CF；只代理 Telegram，无需用户名和密码。"
   ' "$ETC_DIR/mtproto.json"
   say "密钥保存在 $ETC_DIR/mtproto.json（仅 root 可读）；更新时保留。"
+  if [[ -x "$MT_PROTECT_SCRIPT" ]]; then
+    say "MTProto 新连接限速防护：已启用（${MT_PROTECT_RATE}/秒，突发 $MT_PROTECT_BURST）。"
+  else
+    say 'MTProto 新连接限速防护：未启用；可在菜单中选择“安装 / 配置 MTProto 防护”。'
+  fi
+}
+
+tcp_overflow_counters() {
+  [[ -r /proc/net/netstat ]] || return 0
+  awk '
+    $1 == "TcpExt:" && !header {
+      for (i = 2; i <= NF; i++) index_of[$i] = i
+      header = 1
+      next
+    }
+    $1 == "TcpExt:" && header {
+      if (index_of["ListenOverflows"] && index_of["ListenDrops"])
+        printf "%s %s\n", $(index_of["ListenOverflows"]), $(index_of["ListenDrops"])
+      exit
+    }
+  ' /proc/net/netstat
 }
 
 install_mtproto() {
   local file old_port=53528 old_public='' candidate port_owned=0
   [[ -x "$BIN_DIR/sing-box" && -r "$ETC_DIR/sing-box.json" ]] || die '请先选择“安装与配置”，再新增 MTProto。'
   command -v python3 >/dev/null && command -v ss >/dev/null && command -v tar >/dev/null || die 'Missing python3, ss or tar; run install/update first.'
-  MT_FILES=("$BIN_DIR/mtg" "$ETC_DIR/mtproto.json" "$ETC_DIR/mtproto.toml"
+  MT_FILES=("$BIN_DIR/mtg" "$ETC_DIR/mtproto.json" "$ETC_DIR/mtproto.toml" "$MT_PROTECT_SCRIPT"
     "$ETC_DIR/mtproto-selinux-fcontext" "$(service_file "$MT_UNIT")")
   [[ ! -L $ETC_DIR && ! -L $BIN_DIR ]] || die 'Managed directories must not be symlinks.'
   for file in "${MT_FILES[@]}"; do [[ ! -L $file ]] || die "Managed file must not be a symlink: $file"; done
@@ -2058,6 +2149,12 @@ install_mtproto() {
   install -m 0755 "$WORK_DIR/mtg-stage/mtg" "$BIN_DIR/mtg"
   install -m 0600 "$candidate" "$ETC_DIR/mtproto.json"
   install -m 0640 -o root -g "$SERVICE_USER" "$WORK_DIR/mtproto.toml" "$ETC_DIR/mtproto.toml"
+  if [[ -e "$MT_PROTECT_SCRIPT" ]]; then
+    [[ -x "$MT_PROTECT_SCRIPT" ]] || die 'MTProto 防护脚本不可执行，拒绝更新 MTProto 端口。'
+    "$MT_PROTECT_SCRIPT" remove || die '无法暂时移除旧 MTProto 防护规则，拒绝更新端口。'
+    render_mtproto_firewall "$MT_PORT" "$WORK_DIR/mtproto-firewall.sh"
+    install -m 0750 "$WORK_DIR/mtproto-firewall.sh" "$MT_PROTECT_SCRIPT"
+  fi
   mtproto_selinux
   render_mtproto_unit
   svc reload
@@ -2068,6 +2165,49 @@ install_mtproto() {
   trap - INT TERM
   say 'MTProto 已启动并设置开机自启，本机监听检查通过；Telegram 外网连接请在手机上实测。'
   show_mtproto
+}
+
+ensure_iptables() {
+  command -v iptables >/dev/null && return 0
+  say '未找到 iptables，正在安装防护所需的软件包。'
+  case $PACKAGE_MANAGER in
+    apt) apt_install_packages iptables ;;
+    dnf|yum) rpm_install iptables ;;
+    apk) apk add --no-cache iptables ;;
+  esac
+  command -v iptables >/dev/null || die '未找到 iptables，无法安装 MTProto 防护。'
+}
+
+install_mtproto_protection() {
+  local port candidate
+  [[ -r "$ETC_DIR/mtproto.json" ]] || die '请先运行 mtproto 安装 MTProto。'
+  validate_mtproto_file "$ETC_DIR/mtproto.json"
+  ensure_iptables
+  port=$(jq -r .port "$ETC_DIR/mtproto.json")
+  [[ ! -L "$MT_PROTECT_SCRIPT" ]] || die 'MTProto 防护脚本不能是符号链接。'
+  make_workdir
+  candidate="$WORK_DIR/mtproto-firewall.sh"
+  render_mtproto_firewall "$port" "$candidate"
+  "$candidate" apply || die 'MTProto 防护规则安装失败；现有防火墙规则未被脚本覆盖。'
+  install -m 0750 "$candidate" "$MT_PROTECT_SCRIPT"
+  render_mtproto_unit
+  svc reload
+  if svc is-active "$MT_UNIT"; then
+    restart_service "$MT_UNIT"
+    wait_mtproto "$port" || die 'MTProto 重启检查失败，防护规则已安装但服务未就绪。'
+  fi
+  say "MTProto 防护已启用：TCP $port 新连接限速 ${MT_PROTECT_RATE}/秒，突发上限 $MT_PROTECT_BURST。"
+  say '防护规则由 MTProto 服务启动时自动恢复；不会修改 SSH 和其他端口。'
+}
+
+remove_mtproto_protection() {
+  [[ -e "$MT_PROTECT_SCRIPT" ]] || { say 'MTProto 防护未安装。'; return 0; }
+  [[ ! -L "$MT_PROTECT_SCRIPT" ]] || die 'MTProto 防护脚本不能是符号链接。'
+  "$MT_PROTECT_SCRIPT" remove || die '移除 MTProto 防护规则失败。'
+  rm -f -- "$MT_PROTECT_SCRIPT"
+  render_mtproto_unit
+  svc reload
+  say 'MTProto 防护已移除，其他防火墙规则未修改。'
 }
 
 enable_mtproto_time_fallback() {
@@ -2212,7 +2352,7 @@ configure_time_sync() {
 }
 
 show_status() {
-  local domain unit
+  local domain unit mt_port queue queued max_queue counters overflow drops
   menu_overview
   for unit in "$VPN_UNIT" "$CF_UNIT" "$SUB_UNIT" "$MT_UNIT"; do
     if [[ -f $(service_file "$unit") ]]; then
@@ -2222,6 +2362,27 @@ show_status() {
   done
   printf '\n节点端口：REALITY TCP %s → %s；Hy2 UDP %s → %s（%s）\n' "$PUBLIC_PORT" "$REALITY_PORT" "$HY2_PUBLIC_PORT" "$HY2_PORT" "$([[ $HY2_ENABLED == 1 ]] && printf '已配置' || printf '未启用')"
   printf '本地端口：WS %s；订阅 %s；隧道健康检查 %s\n' "$WS_PORT" "$SUB_PORT" "$METRICS_PORT"
+  if [[ -r "$ETC_DIR/mtproto.json" ]]; then
+    mt_port=$(jq -r .port "$ETC_DIR/mtproto.json")
+    queue=$(ss -H -ltn "sport = :$mt_port" | awk 'NR == 1 { print $2 "/" $3 }')
+    say "MTProto TCP $mt_port 监听队列：${queue:-未监听}"
+    if [[ -x "$MT_PROTECT_SCRIPT" ]]; then
+      say "MTProto 新连接限速防护：已启用（${MT_PROTECT_RATE}/秒，突发 $MT_PROTECT_BURST）。"
+    else
+      say 'MTProto 新连接限速防护：未启用。'
+    fi
+    if [[ $queue =~ ^([0-9]+)/([0-9]+)$ ]]; then
+      queued=${BASH_REMATCH[1]}; max_queue=${BASH_REMATCH[2]}
+      if ((max_queue > 0 && queued * 100 >= max_queue * 80)); then
+        say "警告：MTProto 监听队列已使用 ${queued}/${max_queue}，接近满载。"
+      fi
+    fi
+    counters=$(tcp_overflow_counters || true)
+    if [[ $counters =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+      overflow=${BASH_REMATCH[1]}; drops=${BASH_REMATCH[2]}
+      say "内核 TCP 监听溢出累计：ListenOverflows=$overflow，ListenDrops=$drops。"
+    fi
+  fi
   domain=$(current_domain || true)
   say "当前临时隧道域名：${domain:-暂不可用}"
   if curl -fsS --max-time 3 "http://127.0.0.1:$METRICS_PORT/ready" >/dev/null 2>&1; then
@@ -2301,8 +2462,8 @@ main() {
     install) install_stack ;;
     time-sync) configure_time_sync ;;
     uninstall) uninstall_stack ;;
-    mtproto|mtproto-info|export|status|logs|start|restart|restart-tunnel|set-entry|stop)
-      if [[ $command_name == mtproto || $command_name == mtproto-info ]]; then
+    mtproto|mtproto-protect|mtproto-unprotect|mtproto-info|export|status|logs|start|restart|restart-tunnel|set-entry|stop)
+      if [[ $command_name == mtproto || $command_name == mtproto-protect || $command_name == mtproto-unprotect || $command_name == mtproto-info ]]; then
         [[ -r "$ETC_DIR/managed-by" ]] || die '请先选择“安装与配置”，完成后再安装 MTProto。'
       fi
       need_installation
@@ -2312,6 +2473,8 @@ main() {
       case $command_name in status|logs|stop) ;; *) validate_settings ;; esac
       case $command_name in
         mtproto) install_mtproto ;;
+        mtproto-protect) install_mtproto_protection ;;
+        mtproto-unprotect) remove_mtproto_protection ;;
         mtproto-info) show_mtproto ;;
         export)
           domain=$(current_domain || true)
