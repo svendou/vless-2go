@@ -21,8 +21,10 @@ MT_PROTECT_SCRIPT=$BIN_DIR/mtproto-firewall.sh
 DATA_DIR=/var/lib/personal-vpn-stack
 VPN_UNIT=personal-vpn-stack.service
 CF_UNIT=personal-vpn-stack-cloudflare.service
+HY2_UNIT=personal-vpn-stack-hy2.service
 SUB_UNIT=personal-vpn-stack-subscription.service
 MT_UNIT=personal-vpn-stack-mtproto.service
+MT_HEALTH_UNIT=personal-vpn-stack-mtproto-health.service
 SERVICE_USER=personal-vpn-stack
 SERVICE_UID='' SERVICE_GID=''
 UNIT_DIR=/etc/systemd/system
@@ -41,21 +43,27 @@ INSTALL_TRANSACTION=0
 FAILURE_LOG=''
 VPN_WAS_ACTIVE=0
 CF_WAS_ACTIVE=0
+HY2_WAS_ACTIVE=0
+PREVIOUS_SELINUX_PATTERN=''
 SUB_WAS_ACTIVE=0
 SELINUX_RULE_ADDED=0
 INTERACTIVE_INSTALL=${PERSONAL_VPN_INTERACTIVE:-0}
 SERVER_ADDR='' REALITY_PORT='' PUBLIC_PORT='' WS_PORT='' METRICS_PORT='' REALITY_SNI=''
-CF_ENTRY='' TUNNEL_PROTOCOL='' SING_BOX_VERSION='' CF_VERSION='' OUTPUT_DIR=''
+CF_ENTRY='' TUNNEL_PROTOCOL='' XRAY_VERSION='' CF_VERSION='' OUTPUT_DIR=''
 HY2_PORT='' HY2_PUBLIC_PORT='' SUB_PORT='' SUB_PUBLIC_PORT='' HY2_REQUESTED='' NODE_COUNTRY=''
 HY2_ENABLED=1
+HY2_VERSION=''
 MT_PORT='' MT_PUBLIC_PORT=''
 MT_TRANSACTION=0
 MT_WAS_ACTIVE=0
 MT_WAS_ENABLED=0
+MT_HEALTH_WAS_ACTIVE=0
+MT_HEALTH_WAS_ENABLED=0
 MT_SELINUX_ADDED=0
 MT_FILES=()
 MT_PROTECT_RATE=25
 MT_PROTECT_BURST=100
+BLOCKED_CIDRS='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","fc00::/7","fe80::/10","ff00::/8"]'
 MANAGED_FILES=()
 PREVIOUS_ENABLED_UNITS=()
 SCRIPT_PATH=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")
@@ -78,7 +86,7 @@ usage() {
 需要 Python 3.6+，脚本会安装依赖并检查版本。
 
 安装与配置：
-  install          安装 / 更新 sing-box、Cloudflare 隧道和订阅服务。
+  install          安装 / 更新 Xray、Cloudflare 隧道和订阅服务。
   help             显示本帮助。
 节点与订阅：
   export           查看订阅地址，导出节点、Mihomo 配置及二维码。
@@ -107,8 +115,9 @@ Telegram 代理：
   --reality-sni HOST        REALITY 握手目标（默认 www.cloudflare.com）。
   --cf-entry HOST           CF 入口 IP / 域名 / auto（默认 cdns.doon.eu.org）。
   --tunnel-protocol NAME    隧道协议：http2（默认）或 quic。
-  --sing-box-version TAG    sing-box 版本（默认 v1.14.4，支持 latest）。
+  --xray-version TAG        Xray 版本（默认 v26.11.9，支持 latest）。
   --cloudflared-version TAG cloudflared 版本（默认 2026.10.1，支持 latest）。
+  --hy2-version TAG         Hysteria2 版本（默认 app/v2.13.0，支持 latest）。
   --hy2-port PORT           Hy2 内部 UDP 端口（默认 43526）。
   --hy2-public-port PORT    Hy2 公网 UDP 端口（默认同内部端口）。
   --subscription-port PORT 订阅内部 TCP 端口（默认 43518）。
@@ -124,7 +133,7 @@ Telegram 代理：
   bash deploy-personal-vpn.sh install --server YOUR_PUBLIC_IP
   bash deploy-personal-vpn.sh set-entry --cf-entry 104.18.42.54
 
-直接部署 sing-box；更新保留账号、密钥和端口，程序下载并校验后才替换文件。
+直接部署 Xray；更新保留账号、密钥和端口，程序下载并校验后才替换文件。
 安装失败会尝试回滚。临时隧道重建后域名可能变化，请重新导入 HTTPS 订阅。
 请自行配置防火墙和服务商 NAT 映射；脚本不会修改 SSH 和系统网络参数。
 HELP
@@ -207,49 +216,60 @@ interactive_cf_entry() {
 }
 
 interactive_menu() {
-  local selection result pause_answer
-  local footer='↑↓ / j k / 数字选择；Enter 确认；0 / q 返回'
-  local -a labels=('安装与配置' '节点与订阅' 'Telegram 代理' '服务与诊断' '卸载全部组件' '退出')
-  local -a menu_args=()
+  local selection result pause_answer menu_interactive
+  local footer='输入编号 / ↑↓ 选择；Enter 确认；0 / q 返回'
+  local -a menu_args=() install_labels=()
   while :; do
     menu_overview
     menu_args=()
-    arrow_menu '个人节点管理 · sing-box' "$footer" 0 "${labels[@]}" || return 0
+    menu_interactive=0
+    arrow_menu '个人节点管理' '输入编号 / ↑↓ 选择；Enter 确认；0 / q 退出' 0 \
+      '安装与更新' '节点与订阅' 'Telegram 代理' '服务控制' '状态与日志' '卸载全部组件' || return 0
     selection=$MENU_SELECTION
     case $selection in
-      0) menu_args=(install) ;;
+      0)
+        install_labels=('安装 / 调整节点配置')
+        if [[ -r "$ETC_DIR/settings.json" ]]; then
+          install_labels+=('重新安装（保留当前配置）' '更新 Xray 至最新稳定版（保留配置）')
+        fi
+        arrow_menu '安装与更新' "$footer" 0 "${install_labels[@]}" || continue
+        case $MENU_SELECTION in
+          0) menu_args=(install); menu_interactive=1 ;;
+          1) menu_args=(install) ;;
+          2) menu_args=(install --xray-version latest) ;;
+        esac ;;
       1)
-        arrow_menu '节点与订阅' "$footer" 0 '查看 / 导出订阅、节点与二维码' '更改 CF 入口' '重建临时隧道（订阅域名会变化）' '返回' || continue
+        arrow_menu '节点与订阅' "$footer" 0 '查看节点、订阅与二维码' '更换 CF 入口' '重建 CF 隧道（订阅域名会变化）' || continue
         case $MENU_SELECTION in
           0) menu_args=(export) ;;
           1) interactive_cf_entry || continue; menu_args=(set-entry --cf-entry "$CF_ENTRY") ;;
           2) menu_args=(restart-tunnel) ;;
-          *) continue ;;
         esac ;;
       2)
-        arrow_menu 'Telegram 代理' "$footer" 0 '安装 / 更新 MTProto' '查看 MTProto 连接信息' '安装 / 配置 MTProto 防护' '配置 Chrony 自动校时' '返回' || continue
+        arrow_menu 'Telegram 代理' "$footer" 0 '安装 / 更新 TG 代理' '查看 TG 代理链接' '安装 / 配置连接防护' '配置自动校时' || continue
         case $MENU_SELECTION in
-          0) menu_args=(mtproto) ;;
+          0) menu_args=(mtproto); menu_interactive=1 ;;
           1) menu_args=(mtproto-info) ;;
           2) menu_args=(mtproto-protect) ;;
           3) menu_args=(time-sync) ;;
-          *) continue ;;
         esac ;;
       3)
-        arrow_menu '服务与诊断' "$footer" 0 '查看状态、版本与端口' '查看最近日志' '启动全部服务' '重启代理与订阅（保留隧道）' '停止全部服务' '返回' || continue
+        arrow_menu '服务控制' "$footer" 0 '启动全部服务' '重启代理与订阅（保留 CF 隧道）' '停止全部服务' || continue
+        case $MENU_SELECTION in
+          0) menu_args=(start) ;;
+          1) menu_args=(restart) ;;
+          2) menu_args=(stop) ;;
+        esac ;;
+      4)
+        arrow_menu '状态与日志' "$footer" 0 '查看状态、版本与端口' '查看最近服务日志' || continue
         case $MENU_SELECTION in
           0) menu_args=(status) ;;
           1) menu_args=(logs) ;;
-          2) menu_args=(start) ;;
-          3) menu_args=(restart) ;;
-          4) menu_args=(stop) ;;
-          *) continue ;;
         esac ;;
-      4) menu_args=(uninstall) ;;
-      5) return 0 ;;
+      5) menu_args=(uninstall) ;;
     esac
-    # Each action has its own errexit/traps/lock; a failed action cannot kill the menu.
-    if PERSONAL_VPN_INTERACTIVE=1 bash "$SCRIPT_PATH" "${menu_args[@]}"; then
+    # Keep each action isolated so an error returns to the menu.
+    if PERSONAL_VPN_INTERACTIVE=$menu_interactive bash "$SCRIPT_PATH" "${menu_args[@]}"; then
       say '操作完成。'
     else
       result=$?
@@ -267,26 +287,37 @@ service_label() {
 }
 
 menu_overview() {
+  local core version mt_version=''
   printf '\n────────────────────────────────────────\n'
   if [[ -r "$ETC_DIR/settings.json" ]] && command -v jq >/dev/null; then
-    jq -r '"服务器：\(.server)  |  内核：sing-box \(.sing_box_version)",
+    core=$(setting core xray)
+    case $core in
+      xray)
+        version=$("$BIN_DIR/xray" version 2>/dev/null | awk 'NR == 1 { print $2 }') || version=''
+        version=${version:-$(setting xray_version 未知)}
+        core=Xray ;;
+      sing-box)
+        version=$("$BIN_DIR/sing-box" version 2>/dev/null | awk 'NR == 1 { print $3 }') || version=''
+        version=${version:-$(setting sing_box_version 未知)} ;;
+      *) version=未知 ;;
+    esac
+    jq -r --arg core "$core" --arg version "$version" '
+      "服务器：\(.server)  |  内核：\($core) \($version)",
       "Hy2：\(if .hy2_enabled == false then "未启用" else "已配置" end)  |  CF 入口：\(.cf_entry)"' "$ETC_DIR/settings.json" || true
-    printf '核心：%s  隧道：%s  订阅：%s  MTProto：%s\n' "$(service_label "$VPN_UNIT")" "$(service_label "$CF_UNIT")" "$(service_label "$SUB_UNIT")" "$(service_label "$MT_UNIT")"
+    if [[ -x "$BIN_DIR/mtg" ]]; then
+      mt_version=$("$BIN_DIR/mtg" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1) || mt_version=''
+      mt_version="（mtg ${mt_version:-版本未知}）"
+    fi
+    printf '核心：%s  隧道：%s  订阅：%s  MTProto：%s%s\n' "$(service_label "$VPN_UNIT")" "$(service_label "$CF_UNIT")" "$(service_label "$SUB_UNIT")" "$(service_label "$MT_UNIT")" "$mt_version"
   else
-    printf '尚未安装，请选择“安装与配置”。\n'
+    printf '尚未安装，请先进入“安装与更新”。\n'
   fi
   printf '────────────────────────────────────────\n'
 }
 
 interactive_settings() {
-  local detected='' mode enable_hy2 edit_ports=0
-  if [[ -r "$ETC_DIR/settings.json" ]]; then
-    arrow_menu '安装与配置' '更新会保留账号和密钥；0 / q 取消' 0 '保留当前配置，重新安装' '修改地址、端口与 Hy2 设置' '保留配置，更新 sing-box 至最新稳定版' || { say '已取消安装。'; exit 0; }
-    mode=$MENU_SELECTION
-    if ((mode == 0)); then return 0; fi
-    if ((mode == 2)); then SING_BOX_VERSION=latest; return 0; fi
-    edit_ports=1
-  fi
+  local detected='' enable_hy2 edit_ports=0
+  if [[ -r "$ETC_DIR/settings.json" ]]; then edit_ports=1; fi
   if [[ -z $SERVER_ADDR ]]; then
     detected=$(curl -4fsS --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null || true)
     [[ $detected =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || detected=
@@ -314,7 +345,7 @@ interactive_settings() {
   fi
   printf '\n端口配置（公网 → 内部）：REALITY TCP %s → %s；订阅 TCP %s → %s\n' "$PUBLIC_PORT" "$REALITY_PORT" "$SUB_PUBLIC_PORT" "$SUB_PORT"
   if ((HY2_REQUESTED)); then printf 'Hy2 UDP %s → %s\n' "$HY2_PUBLIC_PORT" "$HY2_PORT"; fi
-  printf '将安装 sing-box，提供通用和 Clash Meta / Mihomo 订阅。\n\n'
+  printf '将安装 Xray，提供通用和 Clash Meta / Mihomo 订阅。\n\n'
 }
 
 need_root() { [[ ${EUID} -eq 0 ]] || die 'Run as root.'; }
@@ -327,14 +358,14 @@ need_installation() {
 parse_options() {
   while (($#)); do
     case "$1" in
-      --server|--reality-port|--public-port|--ws-port|--metrics-port|--reality-sni|--cf-entry|--tunnel-protocol|--sing-box-version|--cloudflared-version|--output|--hy2-port|--hy2-public-port|--subscription-port|--subscription-public-port|--country|--mtproto-port|--mtproto-public-port)
+      --server|--reality-port|--public-port|--ws-port|--metrics-port|--reality-sni|--cf-entry|--tunnel-protocol|--xray-version|--hy2-version|--cloudflared-version|--output|--hy2-port|--hy2-public-port|--subscription-port|--subscription-public-port|--country|--mtproto-port|--mtproto-public-port)
         (($# >= 2)) && [[ -n $2 && $2 != --* ]] || die "Missing value for $1"
         case "$1" in
           --server) SERVER_ADDR=$2 ;; --reality-port) REALITY_PORT=$2 ;;
           --public-port) PUBLIC_PORT=$2 ;;
           --ws-port) WS_PORT=$2 ;; --metrics-port) METRICS_PORT=$2 ;;
           --reality-sni) REALITY_SNI=$2 ;; --cf-entry) CF_ENTRY=$2 ;;
-          --tunnel-protocol) TUNNEL_PROTOCOL=$2 ;; --sing-box-version) SING_BOX_VERSION=$2 ;;
+          --tunnel-protocol) TUNNEL_PROTOCOL=$2 ;; --xray-version) XRAY_VERSION=$2 ;; --hy2-version) HY2_VERSION=$2 ;;
           --cloudflared-version) CF_VERSION=$2 ;; --output) OUTPUT_DIR=$2 ;;
           --hy2-port) HY2_PORT=$2 ;; --hy2-public-port) HY2_PUBLIC_PORT=$2 ;;
           --subscription-port) SUB_PORT=$2 ;; --subscription-public-port) SUB_PUBLIC_PORT=$2 ;;
@@ -352,7 +383,7 @@ parse_options() {
 setting() { jq -r --arg key "$1" --arg fallback "$2" 'if has($key) and .[$key] != null then .[$key] else $fallback end' "$ETC_DIR/settings.json"; }
 load_settings() {
   if [[ -r "$ETC_DIR/settings.json" ]]; then
-    jq -e '.schema == 2 and .core == "sing-box"' "$ETC_DIR/settings.json" >/dev/null || die '配置不是本脚本的 sing-box 安装，拒绝覆盖。'
+    jq -e '(.schema == 2 and (.core == "xray" or .core == "sing-box")) or (.schema == 1 and (.xray_version | type == "string"))' "$ETC_DIR/settings.json" >/dev/null || die '配置不是本脚本管理的 Xray / sing-box 安装，拒绝覆盖。'
     SERVER_ADDR=${SERVER_ADDR:-$(setting server '')}
     REALITY_PORT=${REALITY_PORT:-$(setting reality_port 43526)}
     PUBLIC_PORT=${PUBLIC_PORT:-$(setting public_port "$REALITY_PORT")}
@@ -361,8 +392,9 @@ load_settings() {
     REALITY_SNI=${REALITY_SNI:-$(setting reality_sni www.cloudflare.com)}
     CF_ENTRY=${CF_ENTRY:-$(setting cf_entry cdns.doon.eu.org)}
     TUNNEL_PROTOCOL=${TUNNEL_PROTOCOL:-$(setting tunnel_protocol http2)}
-    SING_BOX_VERSION=${SING_BOX_VERSION:-$(setting sing_box_version v1.14.4)}
+    XRAY_VERSION=${XRAY_VERSION:-$(setting xray_version v26.11.9)}
     CF_VERSION=${CF_VERSION:-$(setting cloudflared_version 2026.10.1)}
+    HY2_VERSION=${HY2_VERSION:-$(setting hy2_version app/v2.13.0)}
     HY2_PORT=${HY2_PORT:-$(setting hy2_port 43526)}
     HY2_PUBLIC_PORT=${HY2_PUBLIC_PORT:-$(setting hy2_public_port "$HY2_PORT")}
     SUB_PORT=${SUB_PORT:-$(setting subscription_port 43518)}
@@ -378,8 +410,9 @@ load_settings() {
   REALITY_SNI=${REALITY_SNI:-www.cloudflare.com}
   CF_ENTRY=${CF_ENTRY:-cdns.doon.eu.org}
   TUNNEL_PROTOCOL=${TUNNEL_PROTOCOL:-http2}
-  SING_BOX_VERSION=${SING_BOX_VERSION:-v1.14.4}
+  XRAY_VERSION=${XRAY_VERSION:-v26.11.9}
   CF_VERSION=${CF_VERSION:-2026.10.1}
+  HY2_VERSION=${HY2_VERSION:-app/v2.13.0}
   HY2_PORT=${HY2_PORT:-43526}
   HY2_PUBLIC_PORT=${HY2_PUBLIC_PORT:-$HY2_PORT}
   SUB_PORT=${SUB_PORT:-43518}
@@ -408,8 +441,9 @@ validate_settings() {
     validate_mtproto_ports "$(jq -r .port "$ETC_DIR/mtproto.json")" "$(jq -r .public_port "$ETC_DIR/mtproto.json")"
   fi
   [[ -z $NODE_COUNTRY || $NODE_COUNTRY =~ ^[A-Z]{2}$ ]] || die '--country must be a two-letter uppercase code, e.g. US.'
+  [[ $HY2_VERSION == latest || $HY2_VERSION =~ ^app/v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die 'Invalid Hy2 release tag.'
   [[ $HY2_REQUESTED == 0 || $HY2_REQUESTED == 1 ]] || die 'Invalid Hy2 preference.'
-  [[ ( $SING_BOX_VERSION == latest || $SING_BOX_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ) && $CF_VERSION =~ ^[A-Za-z0-9._-]+$ ]] || die 'Invalid release tag.'
+  [[ ( $XRAY_VERSION == latest || $XRAY_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ) && $CF_VERSION =~ ^[A-Za-z0-9._-]+$ ]] || die 'Invalid release tag.'
   [[ $OUTPUT_DIR == /* && $OUTPUT_DIR != / && $OUTPUT_DIR != *$'\n'* ]] || die '--output must be an absolute directory path.'
 }
 
@@ -620,7 +654,7 @@ apt_install_prerequisites() {
   # APT can fail solely on jq/libjq1 while all other tools are already usable.
   # Only that case may use the verified standalone jq; missing tools still fail.
   if command -v jq >/dev/null; then return 1; fi
-  for cmd in curl tar gzip openssl setpriv flock ss useradd groupadd userdel groupdel getent install python3 sha256sum; do
+  for cmd in curl tar gzip unzip openssl setpriv flock ss useradd groupadd userdel groupdel getent install python3 sha256sum; do
     command -v "$cmd" >/dev/null || return 1
   done
   has_ca_bundle || return 1
@@ -632,7 +666,7 @@ install_dependencies() {
   local missing=0 cmd
   local -a rpm_packages
   prepare_legacy_centos_repos
-  for cmd in curl tar gzip openssl jq setpriv flock ss useradd groupadd userdel groupdel getent install python3 sha256sum; do
+  for cmd in curl tar gzip unzip openssl jq setpriv flock ss useradd groupadd userdel groupdel getent install python3 sha256sum; do
     command -v "$cmd" >/dev/null || missing=1
   done
   has_ca_bundle || missing=1
@@ -642,10 +676,10 @@ install_dependencies() {
   if ((missing)); then
     say 'Installing small prerequisite packages.'
     if [[ $PACKAGE_MANAGER == apk ]]; then
-      apk add --no-cache bash ca-certificates curl tar gzip openssl jq setpriv flock \
+      apk add --no-cache bash ca-certificates curl tar gzip unzip openssl jq setpriv flock \
         iproute2 shadow coreutils python3
     elif [[ $PACKAGE_MANAGER == dnf || $PACKAGE_MANAGER == yum ]]; then
-      rpm_packages=(ca-certificates tar gzip openssl util-linux iproute shadow-utils coreutils glibc-common python3)
+      rpm_packages=(ca-certificates tar gzip unzip openssl util-linux iproute shadow-utils coreutils glibc-common python3)
       if [[ $DISTRO_MAJOR != 7 ]]; then rpm_packages+=(jq); fi
       # Retain a working curl-minimal instead of conflicting with it by installing curl.
       if ! command -v curl >/dev/null; then rpm_packages+=(curl); fi
@@ -657,7 +691,7 @@ install_dependencies() {
       rpm_install "${rpm_packages[@]}"
     else
       apt_install_prerequisites \
-        ca-certificates curl tar gzip openssl jq util-linux iproute2 passwd coreutils python3 \
+        ca-certificates curl tar gzip unzip openssl jq util-linux iproute2 passwd coreutils python3 \
         || die 'Dependency installation failed; inspect the APT error above, repair the repository/cache, then retry.' 
       if selinux_active; then
         apt_install_packages policycoreutils policycoreutils-python-utils || die 'SELinux dependency installation failed.'
@@ -673,18 +707,24 @@ install_dependencies() {
       apt) apt_install_packages qrencode || say 'QR package unavailable; subscription links will still be exported.' ;;
     esac
   fi
-  for cmd in curl tar gzip openssl jq setpriv flock ss useradd groupadd userdel groupdel getent install python3 sha256sum; do
+  for cmd in curl tar gzip unzip openssl jq setpriv flock ss useradd groupadd userdel groupdel getent install python3 sha256sum; do
     command -v "$cmd" >/dev/null || die "Required command unavailable after dependency installation: $cmd"
   done
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)' || die 'Python 3.6+ is required; the system Python 2 is not used or replaced.'
 }
 
 apply_selinux_contexts() {
-  local pattern="$BIN_DIR/(sing-box|cloudflared)"
-  local -a executables=("$BIN_DIR/sing-box" "$BIN_DIR/cloudflared")
+  local pattern="$BIN_DIR/(xray|cloudflared|hysteria)"
+  local -a executables=("$BIN_DIR/xray" "$BIN_DIR/cloudflared")
+  if [[ -x "$BIN_DIR/hysteria" ]]; then executables+=("$BIN_DIR/hysteria"); fi
   selinux_active || return 0
   command -v semanage >/dev/null && command -v restorecon >/dev/null || die 'SELinux requires semanage and restorecon; install the distribution policycoreutils Python utilities.'
-  if [[ -f "$ETC_DIR/selinux-fcontext" ]]; then
+  if [[ -f "$ETC_DIR/selinux-fcontext" && $(cat "$ETC_DIR/selinux-fcontext") == "$BIN_DIR/(sing-box|cloudflared)" ]]; then
+    PREVIOUS_SELINUX_PATTERN=$(cat "$ETC_DIR/selinux-fcontext")
+    semanage fcontext -a -t bin_t "$pattern"
+    SELINUX_RULE_ADDED=1
+    printf '%s\n' "$pattern" > "$ETC_DIR/selinux-fcontext"
+  elif [[ -f "$ETC_DIR/selinux-fcontext" ]]; then
     [[ $(cat "$ETC_DIR/selinux-fcontext") == "$pattern" ]] || die 'Unexpected managed SELinux label rule.'
     semanage fcontext -m -t bin_t "$pattern"
   else
@@ -698,9 +738,10 @@ apply_selinux_contexts() {
 }
 
 remove_selinux_contexts() {
-  local pattern="$BIN_DIR/(sing-box|cloudflared)"
+  local pattern
   [[ -f "$ETC_DIR/selinux-fcontext" ]] || return 0
-  [[ $(cat "$ETC_DIR/selinux-fcontext") == "$pattern" ]] || die 'Unexpected managed SELinux label rule.'
+  pattern=$(cat "$ETC_DIR/selinux-fcontext")
+  [[ $pattern == "$BIN_DIR/(xray|cloudflared|hysteria)" || $pattern == "$BIN_DIR/(sing-box|cloudflared)" ]] || die 'Unexpected managed SELinux label rule.'
   command -v semanage >/dev/null || die 'semanage is required to remove the managed SELinux label rule.'
   semanage fcontext -d "$pattern"
 }
@@ -777,7 +818,7 @@ collect_failure_diagnostics() {
     done
     if [[ $INIT_SYSTEM == openrc ]]; then
       rc-status 2>&1 || true
-      for file in "$RUN_DIR/sing-box.log" "$RUN_DIR/cloudflare.log" "$RUN_DIR/subscription.log"; do
+      for file in "$RUN_DIR/xray.log" "$RUN_DIR/hy2.log" "$RUN_DIR/cloudflare.log" "$RUN_DIR/subscription.log"; do
         printf '\nApplication log: %s\n' "$file"
         if [[ -r $file ]]; then tail -n 40 "$file"; else printf 'Not created.\n'; fi
       done
@@ -819,6 +860,9 @@ download_asset() {
   curl -fsSL --retry 2 --connect-timeout 15 --max-time 180 "$url" -o "$destination" || return 1
   if [[ $digest =~ ^sha256:([0-9a-fA-F]{64})$ ]]; then
     expected=${BASH_REMATCH[1]}
+  elif [[ $repo == XTLS/Xray-core ]]; then
+    curl -fsSL --retry 2 --connect-timeout 15 --max-time 60 "$url.dgst" -o "$destination.dgst" || return 1
+    expected=$(awk '/^SHA2-256=/{print $2}' "$destination.dgst")
   else
     die 'No official SHA-256 digest found; refusing unverified installation.'
   fi
@@ -828,34 +872,36 @@ download_asset() {
 }
 
 stage_binaries() {
-  local arch archive
+  local xray_asset cf_asset
   case $(uname -m) in
-    x86_64|amd64) arch=amd64 ;;
-    aarch64|arm64) arch=arm64 ;;
+    x86_64|amd64) xray_asset=Xray-linux-64.zip; cf_asset=cloudflared-linux-amd64 ;;
+    aarch64|arm64) xray_asset=Xray-linux-arm64-v8a.zip; cf_asset=cloudflared-linux-arm64 ;;
     *) die 'Supported architectures: amd64 and arm64.' ;;
   esac
-  say '下载官方 sing-box、cloudflared，并校验 SHA-256。'
-  # Release asset names include their version. Resolve latest before choosing one.
-  if [[ $SING_BOX_VERSION == latest ]]; then
-    curl -fsSL --retry 2 --connect-timeout 15 --max-time 60 \
-      https://api.github.com/repos/SagerNet/sing-box/releases/latest -o "$WORK_DIR/sing-box-latest.json"
-    SING_BOX_VERSION=$(jq -er '.tag_name' "$WORK_DIR/sing-box-latest.json")
-    [[ $SING_BOX_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid stable sing-box release.'
-  fi
-  archive="sing-box-${SING_BOX_VERSION#v}-linux-$arch"
-  download_asset SagerNet/sing-box "$SING_BOX_VERSION" "$archive.tar.gz" "$WORK_DIR/sing-box.tar.gz"
-  SING_BOX_VERSION=$RESOLVED_TAG
-  mkdir "$WORK_DIR/sing-box-stage"
-  tar -xzf "$WORK_DIR/sing-box.tar.gz" -C "$WORK_DIR/sing-box-stage" --strip-components=1 "$archive/sing-box"
-  install -m 0755 "$WORK_DIR/sing-box-stage/sing-box" "$WORK_DIR/sing-box"
-  "$WORK_DIR/sing-box" version
-  download_asset cloudflare/cloudflared "$CF_VERSION" "cloudflared-linux-$arch" "$WORK_DIR/cloudflared"
+  say 'Downloading official releases and verifying SHA-256.'
+  download_asset XTLS/Xray-core "$XRAY_VERSION" "$xray_asset" "$WORK_DIR/xray.zip"
+  XRAY_VERSION=$RESOLVED_TAG
+  unzip -oq "$WORK_DIR/xray.zip" xray -d "$WORK_DIR"
+  chmod 0755 "$WORK_DIR/xray"
+  "$WORK_DIR/xray" version
+  download_asset cloudflare/cloudflared "$CF_VERSION" "$cf_asset" "$WORK_DIR/cloudflared"
   CF_VERSION=$RESOLVED_TAG
   chmod 0755 "$WORK_DIR/cloudflared"
   "$WORK_DIR/cloudflared" --version
 }
 
-
+stage_hy2_binary() {
+  local asset
+  case $(uname -m) in
+    x86_64|amd64) asset=hysteria-linux-amd64 ;;
+    aarch64|arm64) asset=hysteria-linux-arm64 ;;
+    *) return 1 ;;
+  esac
+  download_asset apernet/hysteria "$HY2_VERSION" "$asset" "$WORK_DIR/hysteria" || return 1
+  chmod 0755 "$WORK_DIR/hysteria" || return 1
+  "$WORK_DIR/hysteria" version || return 1
+  printf '%s\n' "$RESOLVED_TAG" > "$WORK_DIR/hy2-version"
+}
 
 attempt_hy2() {
   local step=$1 saved_log
@@ -876,12 +922,25 @@ attempt_hy2() {
 
 skip_hy2() {
   HY2_ENABLED=0
-  say 'Hy2 未启用；Cloudflare、REALITY 和订阅仍可使用。'
+  say 'WARNING: Hy2 安装或启动失败，已跳过；继续安装 Cloudflare、REALITY 和订阅服务。'
+  if [[ -f $(service_file "$HY2_UNIT") ]]; then
+    svc stop "$HY2_UNIT" >/dev/null 2>&1 || true
+    svc disable "$HY2_UNIT" >/dev/null 2>&1 || true
+    svc reset-failed "$HY2_UNIT" >/dev/null 2>&1 || true
+  fi
 }
 
+prepare_hy2() {
+  install -m 0755 "$WORK_DIR/hysteria" "$BIN_DIR/hysteria" || return 1
+  ensure_hy2_certificate || return 1
+  render_hy2_config || return 1
+}
 
-
-
+start_hy2() {
+  restart_service "$HY2_UNIT" || return 1
+  wait_hy2 || return 1
+  svc enable "$HY2_UNIT" || return 1
+}
 
 check_ports() {
   local port key old_port owner
@@ -899,7 +958,7 @@ check_ports() {
   if ((HY2_ENABLED)) && ss -H -lun "sport = :$HY2_PORT" | grep -q .; then
     old_port=
     [[ ! -r "$ETC_DIR/settings.json" ]] || old_port=$(setting hy2_port '')
-    if [[ $HY2_PORT != "$old_port" ]] || ! { [[ -r "$ETC_DIR/sing-box.json" ]] && svc is-active "$VPN_UNIT"; }; then
+    if [[ $HY2_PORT != "$old_port" ]] || ! { svc is-active "$HY2_UNIT" || { [[ $(setting core xray) == sing-box ]] && svc is-active "$VPN_UNIT"; }; }; then
       HY2_ENABLED=0
       say "WARNING: UDP $HY2_PORT 已被其他服务占用，跳过 Hy2，保留其他节点。"
     fi
@@ -908,23 +967,26 @@ check_ports() {
 
 backup_managed_files() {
   local file unit
-  MANAGED_FILES=("$BIN_DIR/sing-box" "$ETC_DIR/sing-box.json" "$ETC_DIR/managed-by"
+  MANAGED_FILES=("$BIN_DIR/xray" "$ETC_DIR/xray.json" "$ETC_DIR/managed-by"
+    "$BIN_DIR/sing-box" "$ETC_DIR/sing-box.json"
+    "$BIN_DIR/hysteria" "$ETC_DIR/hy2.json"
     "$BIN_DIR/cloudflared" "$BIN_DIR/subscription.py"
     "$ETC_DIR/settings.json" "$ETC_DIR/identities.json"
     "$ETC_DIR/hy2.crt" "$ETC_DIR/hy2.key"
     "$ETC_DIR/subscription.json" "$ETC_DIR/selinux-fcontext"
-    "$(service_file "$VPN_UNIT")" "$(service_file "$CF_UNIT")" "$(service_file "$SUB_UNIT")")
+    "$(service_file "$VPN_UNIT")" "$(service_file "$CF_UNIT")" "$(service_file "$HY2_UNIT")" "$(service_file "$SUB_UNIT")")
   mkdir -p "$WORK_DIR/backup"
   for file in "${MANAGED_FILES[@]}"; do
     [[ ! -L $file ]] || die "Managed file must not be a symlink: $file"
     [[ ! -e $file ]] || cp -a --parents "$file" "$WORK_DIR/backup"
   done
-  for unit in "$VPN_UNIT" "$CF_UNIT" "$SUB_UNIT"; do
+  for unit in "$VPN_UNIT" "$CF_UNIT" "$HY2_UNIT" "$SUB_UNIT"; do
     if service_enabled "$unit"; then PREVIOUS_ENABLED_UNITS+=("$unit"); fi
   done
   if svc is-active "$VPN_UNIT"; then VPN_WAS_ACTIVE=1; fi
   if svc is-active "$CF_UNIT"; then CF_WAS_ACTIVE=1; fi
   if svc is-active "$SUB_UNIT"; then SUB_WAS_ACTIVE=1; fi
+  if svc is-active "$HY2_UNIT"; then HY2_WAS_ACTIVE=1; fi
   INSTALL_TRANSACTION=1
   trap 'die "Installation interrupted; restoring previous installation."' INT TERM
 }
@@ -943,12 +1005,15 @@ rollback() {
   INSTALL_TRANSACTION=0
   say "Installation failed; restoring only this script's managed files."
   if ((SELINUX_RULE_ADDED)); then
-    semanage fcontext -d "$BIN_DIR/(sing-box|cloudflared)" || say 'Could not remove the new SELinux label rule during rollback.'
+    semanage fcontext -d "$BIN_DIR/(xray|cloudflared|hysteria)" || say 'Could not remove the new SELinux label rule during rollback.'
     SELINUX_RULE_ADDED=0
   fi
-  svc stop "$SUB_UNIT" "$CF_UNIT" "$VPN_UNIT" >/dev/null 2>&1 || true
+  if [[ -n $PREVIOUS_SELINUX_PATTERN ]]; then
+    semanage fcontext -m -t bin_t "$PREVIOUS_SELINUX_PATTERN" 2>/dev/null || semanage fcontext -a -t bin_t "$PREVIOUS_SELINUX_PATTERN" || true
+  fi
+  svc stop "$SUB_UNIT" "$HY2_UNIT" "$CF_UNIT" "$VPN_UNIT" >/dev/null 2>&1 || true
   # Fresh installs must not leave runlevel symlinks for services rolled back away.
-  for file in "$VPN_UNIT" "$CF_UNIT" "$SUB_UNIT"; do
+  for file in "$VPN_UNIT" "$CF_UNIT" "$HY2_UNIT" "$SUB_UNIT"; do
     if [[ ! -e "$WORK_DIR/backup$(service_file "$file")" ]]; then svc disable "$file" >/dev/null 2>&1 || true; fi
   done
   for file in "${MANAGED_FILES[@]}"; do
@@ -959,11 +1024,12 @@ rollback() {
     fi
   done
   svc reload || true
-  for file in "$VPN_UNIT" "$CF_UNIT" "$SUB_UNIT"; do svc disable "$file" >/dev/null 2>&1 || true; done
+  for file in "$VPN_UNIT" "$CF_UNIT" "$HY2_UNIT" "$SUB_UNIT"; do svc disable "$file" >/dev/null 2>&1 || true; done
   for file in "${PREVIOUS_ENABLED_UNITS[@]}"; do svc enable "$file" || true; done
   if ((VPN_WAS_ACTIVE)); then svc start "$VPN_UNIT" || true; fi
   if ((CF_WAS_ACTIVE)); then svc start "$CF_UNIT" || true; fi
   if ((SUB_WAS_ACTIVE)); then svc start "$SUB_UNIT" || true; fi
+  if ((HY2_WAS_ACTIVE)); then svc start "$HY2_UNIT" || true; fi
   if [[ ! -e "$WORK_DIR/backup$ETC_DIR/managed-by" ]]; then
     rmdir -- "$ETC_DIR" "$BIN_DIR" 2>/dev/null || true
   fi
@@ -999,11 +1065,11 @@ ensure_identities() {
       || die '账号配置无效，拒绝覆盖现有密钥。'
     return
   fi
-  output=$("$BIN_DIR/sing-box" generate reality-keypair)
+  output=$("$BIN_DIR/xray" x25519)
   private=$(awk '/^PrivateKey:/{print $NF}' <<<"$output")
   public=$(awk '/^(Password|PublicKey)/{print $NF;exit}' <<<"$output")
-  [[ -n $private && -n $public ]] || die 'Unrecognized sing-box reality-keypair output.'
-  uuid=$("$BIN_DIR/sing-box" generate uuid)
+  [[ -n $private && -n $public ]] || die 'Unrecognized Xray x25519 output.'
+  uuid=$("$BIN_DIR/xray" uuid)
   jq -n --arg private "$private" --arg public "$public" --arg sid "$(openssl rand -hex 8)" \
     --arg path "/cf-$(openssl rand -hex 12)" \
     --arg uuid "$uuid" --arg hp "$(openssl rand -hex 24)" --arg token "$(openssl rand -hex 24)" \
@@ -1022,13 +1088,13 @@ detect_node_country() {
 write_settings() {
   jq -n --arg server "$SERVER_ADDR" --argjson rp "$REALITY_PORT" --argjson pp "$PUBLIC_PORT" --argjson wp "$WS_PORT" \
     --argjson mp "$METRICS_PORT" --arg sni "$REALITY_SNI" --arg entry "$CF_ENTRY" \
-    --arg protocol "$TUNNEL_PROTOCOL" --arg version "$SING_BOX_VERSION" --arg cv "$CF_VERSION" \
+    --arg protocol "$TUNNEL_PROTOCOL" --arg version "$XRAY_VERSION" --arg cv "$CF_VERSION" --arg hv "$HY2_VERSION" \
     --argjson hp "$HY2_PORT" --argjson hpp "$HY2_PUBLIC_PORT" --argjson sp "$SUB_PORT" --argjson spp "$SUB_PUBLIC_PORT" \
     --arg country "$NODE_COUNTRY" --argjson he "$HY2_ENABLED" --argjson requested "$HY2_REQUESTED" \
-    '{schema:2,core:"sing-box",sing_box_version:$version,server:$server,reality_port:$rp,public_port:$pp,
+    '{schema:2,core:"xray",xray_version:$version,server:$server,reality_port:$rp,public_port:$pp,
       ws_port:$wp,metrics_port:$mp,reality_sni:$sni,cf_entry:$entry,tunnel_protocol:$protocol,cloudflared_version:$cv,
       hy2_port:$hp,hy2_public_port:$hpp,subscription_port:$sp,subscription_public_port:$spp,
-      node_country:$country,hy2_enabled:($he==1),hy2_requested:$requested}' > "$ETC_DIR/settings.json"
+      node_country:$country,hy2_version:$hv,hy2_enabled:($he==1),hy2_requested:$requested}' > "$ETC_DIR/settings.json"
   chmod 0600 "$ETC_DIR/settings.json"
 }
 
@@ -1077,6 +1143,16 @@ OPENSSL_CONFIG
 }
 
 
+
+render_hy2_config() {
+  jq --arg listen "0.0.0.0:$HY2_PORT" --arg cert "$ETC_DIR/hy2.crt" --arg key "$ETC_DIR/hy2.key" \
+    --argjson blocked "$BLOCKED_CIDRS" \
+    '{listen:$listen,tls:{cert:$cert,key:$key},auth:{type:"password",password:.hy2_password},
+      acl:{inline:($blocked | map("reject(" + . + ")"))}}' \
+    "$ETC_DIR/identities.json" > "$ETC_DIR/hy2.json" || return 1
+  chown root:"$SERVICE_USER" "$ETC_DIR/hy2.json" || return 1
+  chmod 0640 "$ETC_DIR/hy2.json"
+}
 
 write_subscription_config() {
   local pin='' file
@@ -1301,7 +1377,7 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
             self.send_body(503, b"Temporarily unavailable\n", head_only)
 
     def proxy_websocket(self, cfg):
-        # Only this configured path can reach the fixed loopback sing-box endpoint.
+        # Only this configured path can reach the fixed loopback xray endpoint.
         self.close_connection = True
         try:
             upstream = socket.create_connection(("127.0.0.1", int(cfg["ws_port"])), timeout=10)
@@ -1442,27 +1518,21 @@ SUBSCRIPTION_PY
 }
 
 render_core_config() {
-  jq --argjson rp "$REALITY_PORT" --argjson wp "$WS_PORT" --arg sni "$REALITY_SNI" \
-    --argjson hp "$HY2_PORT" --argjson he "$HY2_ENABLED" --arg cert "$ETC_DIR/hy2.crt" --arg key "$ETC_DIR/hy2.key" '
+  jq --argjson rp "$REALITY_PORT" --argjson wp "$WS_PORT" --arg sni "$REALITY_SNI" --argjson blocked "$BLOCKED_CIDRS" '
     . as $ids |
-    {log:{level:"warn",timestamp:true},dns:{servers:[{type:"local",tag:"local"}]},inbounds:([
-      {type:"vless",tag:"reality-in",listen:"0.0.0.0",listen_port:$rp,
-       users:[{name:"direct-shared",uuid:$ids.account.direct,flow:"xtls-rprx-vision"}],
-       tls:{enabled:true,server_name:$sni,reality:{enabled:true,
-         handshake:{server:$sni,server_port:443},private_key:$ids.private_key,short_id:[$ids.short_id]}}},
-      {type:"vless",tag:"cloudflare-ws-in",listen:"127.0.0.1",listen_port:$wp,
-       users:[{name:"cf-shared",uuid:$ids.account.cloudflare}],transport:{type:"ws",path:$ids.ws_path}}
-    ] + (if $he==1 then [
-      {type:"hysteria2",tag:"hy2-in",listen:"0.0.0.0",listen_port:$hp,
-       users:[{name:"hy2-shared",password:$ids.hy2_password}],tls:{enabled:true,
-         server_name:"hy2.local",certificate_path:$cert,key_path:$key}}
-    ] else [] end)),outbounds:[{type:"direct",tag:"direct"}],route:{default_domain_resolver:"local",final:"direct",rules:[
-      {action:"resolve",strategy:"ipv4_only"},
-      {ip_cidr:["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","fc00::/7","fe80::/10","ff00::/8"],action:"reject"}
-    ]}}
-  ' "$ETC_DIR/identities.json" > "$ETC_DIR/sing-box.json"
-  chown root:"$SERVICE_USER" "$ETC_DIR/sing-box.json"
-  chmod 0640 "$ETC_DIR/sing-box.json"
+    {log:{access:"none",loglevel:"warning"},inbounds:[
+      {tag:"reality-in",listen:"0.0.0.0",port:$rp,protocol:"vless",
+       settings:{decryption:"none",clients:[{id:$ids.account.direct,email:"direct-shared",flow:"xtls-rprx-vision"}]},
+       streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,target:($sni+":443"),xver:0,
+         serverNames:[$sni],privateKey:$ids.private_key,shortIds:[$ids.short_id]}}},
+      {tag:"cloudflare-ws-in",listen:"127.0.0.1",port:$wp,protocol:"vless",
+       settings:{decryption:"none",clients:[{id:$ids.account.cloudflare,email:"cf-shared"}]},
+       streamSettings:{network:"ws",security:"none",wsSettings:{path:$ids.ws_path}}}
+    ],outbounds:[{tag:"direct",protocol:"freedom",settings:{targetStrategy:"UseIPv4"}},{tag:"block",protocol:"blackhole"}],
+    routing:{domainStrategy:"IPOnDemand",rules:[{type:"field",ip:$blocked,outboundTag:"block"}]}}
+  ' "$ETC_DIR/identities.json" > "$ETC_DIR/xray.json"
+  chown root:"$SERVICE_USER" "$ETC_DIR/xray.json"
+  chmod 0640 "$ETC_DIR/xray.json"
 }
 
 resolve_service_identity() {
@@ -1479,7 +1549,7 @@ render_units() {
   resolve_service_identity
   cat > "$UNIT_DIR/$VPN_UNIT" <<UNIT
 [Unit]
-Description=Managed personal VPN sing-box (REALITY, WebSocket, Hy2)
+Description=Managed personal VPN REALITY and WebSocket
 Wants=network-online.target
 After=network-online.target
 [Service]
@@ -1487,7 +1557,7 @@ Type=simple
 Environment=GOMEMLIMIT=64MiB
 Environment=GOGC=75
 Environment=GOMAXPROCS=2
-ExecStart=$(command -v setpriv) --reuid=$SERVICE_UID --regid=$SERVICE_GID --clear-groups --bounding-set=-all --no-new-privs $BIN_DIR/sing-box run -c $ETC_DIR/sing-box.json
+ExecStart=$(command -v setpriv) --reuid=$SERVICE_UID --regid=$SERVICE_GID --clear-groups --bounding-set=-all --no-new-privs $BIN_DIR/xray run -config $ETC_DIR/xray.json
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -1520,10 +1590,15 @@ UMask=0077
 LimitNOFILE=16384
 UNIT
   printf '\n[Install]\nWantedBy=multi-user.target\n' >> "$UNIT_DIR/$CF_UNIT"
-  unit=$SUB_UNIT
-  binary=$(command -v python3)
-  arguments="$BIN_DIR/subscription.py $ETC_DIR/subscription.json"
-  cat > "$UNIT_DIR/$unit" <<UNIT
+  for unit in "$HY2_UNIT" "$SUB_UNIT"; do
+    if [[ $unit == "$HY2_UNIT" ]]; then
+      binary="$BIN_DIR/hysteria"
+      arguments="server --config $ETC_DIR/hy2.json --disable-update-check"
+    else
+      binary=$(command -v python3)
+      arguments="$BIN_DIR/subscription.py $ETC_DIR/subscription.json"
+    fi
+    cat > "$UNIT_DIR/$unit" <<UNIT
 [Unit]
 Description=Managed personal VPN ${unit%.service}
 Wants=network-online.target
@@ -1542,21 +1617,26 @@ LimitNOFILE=16384
 [Install]
 WantedBy=multi-user.target
 UNIT
-  chmod 0644 "$UNIT_DIR/$VPN_UNIT" "$UNIT_DIR/$CF_UNIT" "$UNIT_DIR/$SUB_UNIT"
+  done
+  chmod 0644 "$UNIT_DIR/$VPN_UNIT" "$UNIT_DIR/$CF_UNIT" "$UNIT_DIR/$HY2_UNIT" "$UNIT_DIR/$SUB_UNIT"
 }
 
 render_openrc_units() {
   local unit binary arguments logfile service_path
   resolve_service_identity
-  for unit in "$VPN_UNIT" "$CF_UNIT" "$SUB_UNIT"; do
+  for unit in "$VPN_UNIT" "$CF_UNIT" "$HY2_UNIT" "$SUB_UNIT"; do
     if [[ $unit == "$VPN_UNIT" ]]; then
-      binary="$BIN_DIR/sing-box"
-      arguments="run -c $ETC_DIR/sing-box.json"
-      logfile=sing-box.log
+      binary="$BIN_DIR/xray"
+      arguments="run -config $ETC_DIR/xray.json"
+      logfile=xray.log
     elif [[ $unit == "$CF_UNIT" ]]; then
       binary="$BIN_DIR/cloudflared"
       arguments="tunnel --url http://127.0.0.1:$SUB_PORT --no-autoupdate --protocol $TUNNEL_PROTOCOL --edge-ip-version 4 --metrics 127.0.0.1:$METRICS_PORT --loglevel info"
       logfile=cloudflare.log
+    elif [[ $unit == "$HY2_UNIT" ]]; then
+      binary="$BIN_DIR/hysteria"
+      arguments="server --config $ETC_DIR/hy2.json --disable-update-check"
+      logfile=hy2.log
     else
       binary=$(command -v python3)
       arguments="$BIN_DIR/subscription.py $ETC_DIR/subscription.json"
@@ -1626,7 +1706,7 @@ wait_tunnel() {
 
 export_nodes() {
   local domain=${1:-} export_tmp file url name
-  [[ -f "$BIN_DIR/subscription.py" && -f "$ETC_DIR/subscription.json" ]] || die '请先安装 sing-box 和订阅服务。'
+  [[ -f "$BIN_DIR/subscription.py" && -f "$ETC_DIR/subscription.json" ]] || die '请先安装 Xray 和订阅服务。'
   [[ -z $domain ]] || valid_host "$domain" || die 'Invalid current tunnel hostname.'
   [[ ! -L $OUTPUT_DIR ]] || die 'Export directory must not be a symlink.'
   if [[ -d $OUTPUT_DIR && ! -f "$OUTPUT_DIR/.personal-vpn-stack-exports" ]]; then
@@ -1664,7 +1744,7 @@ install_stack() {
     [[ -r "$ETC_DIR/settings.json" && -r "$ETC_DIR/identities.json" ]] || die '现有安装缺少配置或账号文件，请先恢复备份，避免生成新账号。'
     ensure_identities
   else
-    [[ ! -e $(service_file "$VPN_UNIT") && ! -e $(service_file "$CF_UNIT") && ! -e $(service_file "$SUB_UNIT") && ! -e $BIN_DIR ]] || die 'Unmanaged stack files already exist.'
+    [[ ! -e $(service_file "$VPN_UNIT") && ! -e $(service_file "$CF_UNIT") && ! -e $(service_file "$HY2_UNIT") && ! -e $(service_file "$SUB_UNIT") && ! -e $BIN_DIR ]] || die 'Unmanaged stack files already exist.'
   fi
   load_settings
   if ((INTERACTIVE_INSTALL)); then interactive_settings; fi
@@ -1674,6 +1754,9 @@ install_stack() {
   check_ports
   make_workdir
   stage_binaries
+  if ((HY2_ENABLED)); then
+    if ! attempt_hy2 download stage_hy2_binary; then HY2_ENABLED=0; say 'Hy2 下载失败，将跳过可选 Hy2。'; fi
+  fi
   backup_managed_files
   ensure_user
   install -d -m 0750 -o root -g "$SERVICE_USER" "$ETC_DIR"
@@ -1681,14 +1764,15 @@ install_stack() {
   install -d -m 0700 "$DATA_DIR"
   printf '%s\n' "$MARKER" > "$ETC_DIR/managed-by"
   if ((CF_WAS_ACTIVE)) && cmp -s "$WORK_DIR/cloudflared" "$BIN_DIR/cloudflared"; then cf_restart=0; fi
-  install -m 0755 "$WORK_DIR/sing-box" "$BIN_DIR/sing-box"
+  install -m 0755 "$WORK_DIR/xray" "$BIN_DIR/xray"
   install -m 0755 "$WORK_DIR/cloudflared" "$BIN_DIR/cloudflared"
   ensure_identities
   if ((HY2_ENABLED)); then
-    if ! attempt_hy2 certificate ensure_hy2_certificate; then skip_hy2; fi
+    HY2_VERSION=$(cat "$WORK_DIR/hy2-version")
+    if ! attempt_hy2 prepare prepare_hy2; then skip_hy2; fi
   fi
   render_core_config
-  "$BIN_DIR/sing-box" check -c "$ETC_DIR/sing-box.json"
+  "$BIN_DIR/xray" run -test -config "$ETC_DIR/xray.json"
   write_settings
   write_subscription_config
   render_subscription_server
@@ -1696,19 +1780,14 @@ install_stack() {
   render_units
   if ! cmp -s "$(service_file "$CF_UNIT")" "$WORK_DIR/backup$(service_file "$CF_UNIT")"; then cf_restart=1; fi
   svc reload
-  if ! start_core; then
-    if ((HY2_ENABLED)); then
-      say 'sing-box 首次启动检查失败，关闭可选 Hy2 后重试。'
-      skip_hy2
-      render_core_config
-      "$BIN_DIR/sing-box" check -c "$ETC_DIR/sing-box.json"
-      write_settings
-      write_subscription_config
-      start_core || die 'sing-box 启动失败，正在恢复安装前状态。'
-    else
-      die 'sing-box 启动失败，正在恢复安装前状态。'
-    fi
+  start_core || die 'Xray 启动失败，正在恢复安装前状态。'
+  if ((HY2_ENABLED)); then
+    if ! attempt_hy2 start start_hy2; then skip_hy2; fi
+  else
+    skip_hy2
   fi
+  write_settings
+  write_subscription_config
   restart_service "$SUB_UNIT"
   if ((cf_restart)); then restart_service "$CF_UNIT"; fi
   if ! wait_tunnel; then collect_failure_diagnostics; die 'Tunnel did not become ready. Check outbound DNS and TCP/UDP 7844 access.'; fi
@@ -1716,13 +1795,15 @@ install_stack() {
   svc enable "$VPN_UNIT" "$CF_UNIT" "$SUB_UNIT"
   svc reload
   export_nodes "$CURRENT_DOMAIN"
+  rm -f -- "$BIN_DIR/sing-box" "$ETC_DIR/sing-box.json"
+  if [[ -n $PREVIOUS_SELINUX_PATTERN ]]; then semanage fcontext -d "$PREVIOUS_SELINUX_PATTERN"; fi
   INSTALL_TRANSACTION=0
   SELINUX_RULE_ADDED=0
   trap - INT TERM
   if [[ -f "$ETC_DIR/mtproto.json" ]]; then show_mtproto; fi
-  say "sing-box $SING_BOX_VERSION 已就绪：CF、REALITY、订阅服务已启用开机自启。"
+  say "Xray $XRAY_VERSION 已就绪：CF、REALITY、订阅服务已启用开机自启。"
   if ((HY2_ENABLED)); then
-    say "Hy2 由 sing-box 提供，需要 UDP $HY2_PUBLIC_PORT → $HY2_PORT。"
+    say "Hy2 由独立 Hysteria2 服务提供，需要 UDP $HY2_PUBLIC_PORT → $HY2_PORT。"
   else
     say 'Hy2 未启用，订阅包含 CF、REALITY；可在安装菜单重新启用。'
   fi
@@ -1731,7 +1812,7 @@ install_stack() {
 }
 
 start_core() {
-  say '正在启动 sing-box，等待监听端口就绪（最多约 15 秒）……'
+  say '正在启动 Xray，等待监听端口就绪（最多约 15 秒）……'
   if ! restart_service "$VPN_UNIT"; then
     collect_failure_diagnostics
     return 1
@@ -1757,18 +1838,22 @@ PY
 wait_core() {
   local deadline=$((SECONDS + 15))
   while ((SECONDS < deadline)); do
-    if svc is-active "$VPN_UNIT" && tcp_listeners_ready "$REALITY_PORT" "$WS_PORT";
-    then
-      if ((!HY2_ENABLED)) || ss -H -lun "sport = :$HY2_PORT" | grep -q .; then return 0; fi
-    fi
+    if svc is-active "$VPN_UNIT" && tcp_listeners_ready "$REALITY_PORT" "$WS_PORT"; then return 0; fi
     sleep 1
   done
-  say "sing-box 启动检查超时：REALITY TCP $REALITY_PORT、WS TCP $WS_PORT 或已启用的 Hy2 UDP $HY2_PORT 未就绪。"
+  say "Xray 启动检查超时：REALITY TCP $REALITY_PORT 或 WS TCP $WS_PORT 未就绪。"
   collect_failure_diagnostics
   return 1
 }
 
-
+wait_hy2() {
+  local deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    if svc is-active "$HY2_UNIT" && ss -H -lun "sport = :$HY2_PORT" | grep -q .; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
 
 wait_subscription() {
   local token deadline
@@ -1795,6 +1880,11 @@ uninstall_stack() {
   printf '\n将卸载本脚本的 Cloudflare、REALITY、Hy2、MTProto 和订阅服务，删除程序、账号配置及默认目录中的节点文件。\nSSH、防火墙及手工部署的旧服务不受影响。\n'
   read -r -p '确认卸载？输入 y 继续 [N]：' answer || return 0
   [[ $answer == y || $answer == Y ]] || { say '已取消卸载。'; return 0; }
+  if [[ -f $(service_file "$MT_HEALTH_UNIT") ]]; then
+    svc stop "$MT_HEALTH_UNIT"
+    svc disable "$MT_HEALTH_UNIT"
+    rm -f -- "$(service_file "$MT_HEALTH_UNIT")"
+  fi
   if [[ -e "$MT_PROTECT_SCRIPT" ]]; then
     [[ -x "$MT_PROTECT_SCRIPT" ]] || die 'MTProto 防护脚本不可执行，已停止卸载以避免遗留防火墙规则。'
     "$MT_PROTECT_SCRIPT" remove || die '无法移除 MTProto 防护规则，已停止卸载以避免遗留防火墙规则。'
@@ -1809,7 +1899,7 @@ uninstall_stack() {
     rm -f -- "$(service_file "$MT_UNIT")"
   fi
   remove_selinux_contexts
-  for unit in "$SUB_UNIT" "$CF_UNIT" "$VPN_UNIT"; do
+  for unit in "$SUB_UNIT" "$HY2_UNIT" "$CF_UNIT" "$VPN_UNIT"; do
     if [[ -f $(service_file "$unit") ]]; then
       svc stop "$unit"
       svc disable "$unit" >/dev/null 2>&1 || true
@@ -1835,9 +1925,10 @@ uninstall_stack() {
   if id "$SERVICE_USER" >/dev/null 2>&1; then userdel "$SERVICE_USER"; fi
   if getent group "$SERVICE_USER" >/dev/null; then groupdel "$SERVICE_USER"; fi
   if [[ $INIT_SYSTEM == openrc && ! -L $RUN_DIR ]]; then
-    rm -f -- "$RUN_DIR/cloudflare.log" "$RUN_DIR/sing-box.log" "$RUN_DIR/subscription.log" \
-      "$RUN_DIR/${VPN_UNIT%.service}.pid" "$RUN_DIR/${CF_UNIT%.service}.pid" "$RUN_DIR/${SUB_UNIT%.service}.pid" \
-      "$RUN_DIR/mtproto.log" "$RUN_DIR/${MT_UNIT%.service}.pid"
+    rm -f -- "$RUN_DIR/cloudflare.log" "$RUN_DIR/xray.log" "$RUN_DIR/hy2.log" "$RUN_DIR/subscription.log" \
+      "$RUN_DIR/${VPN_UNIT%.service}.pid" "$RUN_DIR/${HY2_UNIT%.service}.pid" "$RUN_DIR/${CF_UNIT%.service}.pid" "$RUN_DIR/${SUB_UNIT%.service}.pid" \
+      "$RUN_DIR/mtproto.log" "$RUN_DIR/${MT_UNIT%.service}.pid" \
+      "$RUN_DIR/mtproto-health.log" "$RUN_DIR/${MT_HEALTH_UNIT%.service}.pid"
     rmdir -- "$RUN_DIR" 2>/dev/null || true
   fi
   say '卸载完成。自行复制或自定义目录导出的节点文件可自行删除。'
@@ -1869,10 +1960,10 @@ stage_mtg() {
     aarch64|arm64) arch=arm64 ;;
     *) die 'MTProto supports amd64 and arm64.' ;;
   esac
-  say 'Downloading official mtg v2.2.8 and verifying SHA-256.'
-  download_asset 9seconds/mtg v2.2.8 "mtg-2.2.8-linux-$arch.tar.gz" "$WORK_DIR/mtg.tar.gz"
+  say 'Downloading official mtg v2.3.0 and verifying SHA-256.'
+  download_asset 9seconds/mtg v2.3.0 "mtg-2.3.0-linux-$arch.tar.gz" "$WORK_DIR/mtg.tar.gz"
   mkdir "$WORK_DIR/mtg-stage"
-  tar -xzf "$WORK_DIR/mtg.tar.gz" -C "$WORK_DIR/mtg-stage" --strip-components=1 "mtg-2.2.8-linux-$arch/mtg"
+  tar -xzf "$WORK_DIR/mtg.tar.gz" -C "$WORK_DIR/mtg-stage" --strip-components=1 "mtg-2.3.0-linux-$arch/mtg"
   chmod 0755 "$WORK_DIR/mtg-stage/mtg"
   "$WORK_DIR/mtg-stage/mtg" --version
 }
@@ -1922,12 +2013,18 @@ remove_jump() {
 
 apply() {
   iptables=\$(iptables_bin) || { echo 'iptables is unavailable.' >&2; exit 1; }
-  "\$iptables" -N "\$CHAIN" >/dev/null 2>&1 || true
-  remove_jump "\$iptables" || true
-  "\$iptables" -F "\$CHAIN"
-  "\$iptables" -I INPUT 1 -p tcp --dport "\$PORT" --syn -j "\$CHAIN"
-  "\$iptables" -A "\$CHAIN" -m limit --limit "\$RATE/second" --limit-burst "\$BURST" -j RETURN
-  "\$iptables" -A "\$CHAIN" -j DROP
+  restore=\$(command -v iptables-restore) || { echo 'iptables-restore is unavailable.' >&2; exit 1; }
+  # Commit both rules together so a failed update preserves the existing chain.
+  "\$restore" --noflush <<RULES || { echo 'MTProto 防护规则应用失败，原有规则已保留。' >&2; exit 1; }
+*filter
+:\$CHAIN - [0:0]
+-F \$CHAIN
+-A \$CHAIN -m limit --limit \$RATE/second --limit-burst \$BURST -j RETURN
+-A \$CHAIN -j DROP
+COMMIT
+RULES
+  "\$iptables" -C INPUT -p tcp --dport "\$PORT" --syn -j "\$CHAIN" >/dev/null 2>&1 ||
+    "\$iptables" -I INPUT 1 -p tcp --dport "\$PORT" --syn -j "\$CHAIN"
 }
 
 remove() {
@@ -1952,6 +2049,154 @@ case \${1:-apply} in
 esac
 SCRIPT
   chmod 0750 "$destination"
+}
+
+render_mtproto_health() {
+  cat > "$BIN_DIR/mtproto-health.py" <<'MT_HEALTH_PY'
+#!/usr/bin/env python3
+"""Recover a running MTProto listener that stops accepting connections."""
+import json
+import socket
+import subprocess
+import sys
+import time
+
+
+class Recovery:
+    def __init__(self):
+        self.failures = 0
+        self.last_restart = None
+
+    def observe(self, active, healthy, now):
+        if not active or healthy:
+            self.failures = 0
+            return False
+        self.failures += 1
+        if self.failures < 3:
+            return False
+        if self.last_restart is not None and now - self.last_restart < 600:
+            return False
+        self.last_restart = now
+        self.failures = 0
+        return True
+
+
+def probe(port):
+    result = subprocess.run(
+        ['ss', '-H', '-ltn', 'sport = :' + str(port)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+        timeout=10, check=True,
+    )
+    rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
+    if not rows:
+        return False, 'listener missing'
+    for row in rows:
+        queued, maximum = int(row[1]), int(row[2])
+        if maximum > 0 and queued * 100 >= maximum * 80:
+            return False, 'accept queue {}/{}'.format(queued, maximum)
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=3):
+            pass
+    except OSError as exc:
+        return False, 'local TCP check: ' + type(exc).__name__
+    return True, 'local TCP and accept queue ready'
+
+
+def service_command(init, unit, action):
+    if init == 'openrc':
+        return ['rc-service', unit[:-8],
+                'status' if action == 'is-active' else action]
+    return ['systemctl', action, unit] + (['--quiet'] if action == 'is-active' else [])
+
+
+def check_once(config, init, unit, recovery):
+    active = subprocess.run(service_command(init, unit, 'is-active'),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=10).returncode == 0
+    if not active:
+        # An intentional stop must never be undone by the health service.
+        recovery.observe(False, False, time.monotonic())
+        return
+    with open(config, encoding='utf-8') as stream:
+        port = json.load(stream)['port']
+    if type(port) is not int or not 1024 <= port <= 65535:
+        raise ValueError('invalid managed MTProto port')
+    healthy, detail = probe(port)
+    restart = recovery.observe(True, healthy, time.monotonic())
+    if not healthy:
+        print('MTProto unhealthy: ' + detail, flush=True)
+    if restart:
+        print('MTProto recovery: three failed checks; restarting (600s cooldown)', flush=True)
+        subprocess.run(service_command(init, unit, 'restart'), timeout=45, check=True)
+        healthy, detail = probe(port)
+        print('MTProto after restart: ' + detail, flush=True)
+
+
+def main():
+    import fcntl
+    config, init, unit, lock_path = sys.argv[1:]
+    recovery = Recovery()
+    print('MTProto health monitor started: interval=60s failures=3 cooldown=600s', flush=True)
+    while True:
+        try:
+            # Share the deploy script's lock so stop/update/uninstall cannot race recovery.
+            with open(lock_path, 'a') as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    recovery.failures = 0
+                else:
+                    check_once(config, init, unit, recovery)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            recovery.failures = 0
+            print('MTProto monitor error: ' + type(exc).__name__, flush=True)
+        time.sleep(60)
+
+
+if __name__ == '__main__':
+    main()
+MT_HEALTH_PY
+  chmod 0700 "$BIN_DIR/mtproto-health.py"
+  if [[ $INIT_SYSTEM == openrc ]]; then
+    cat > "$(service_file "$MT_HEALTH_UNIT")" <<UNIT
+#!/sbin/openrc-run
+description="Managed MTProto health and recovery"
+supervisor="supervise-daemon"
+command="$(command -v python3)"
+command_args="-u $BIN_DIR/mtproto-health.py $ETC_DIR/mtproto.json $INIT_SYSTEM $MT_UNIT /run/lock/personal-vpn-stack.lock"
+pidfile="$RUN_DIR/${MT_HEALTH_UNIT%.service}.pid"
+respawn_delay=5
+respawn_max=0
+respawn_period=60
+output_log="$RUN_DIR/mtproto-health.log"
+error_log="$RUN_DIR/mtproto-health.log"
+depend() {
+  need net
+  after ${MT_UNIT%.service}
+}
+start_pre() {
+  checkpath --directory --mode 0750 --owner root:$SERVICE_USER "$RUN_DIR" || return 1
+  checkpath --file --mode 0600 --owner root:root "$RUN_DIR/mtproto-health.log" || return 1
+}
+UNIT
+    chmod 0755 "$(service_file "$MT_HEALTH_UNIT")"
+  else
+    cat > "$(service_file "$MT_HEALTH_UNIT")" <<UNIT
+[Unit]
+Description=Managed MTProto health and recovery
+After=network-online.target $MT_UNIT
+[Service]
+Type=simple
+ExecStart=$(command -v python3) -u $BIN_DIR/mtproto-health.py $ETC_DIR/mtproto.json $INIT_SYSTEM $MT_UNIT /run/lock/personal-vpn-stack.lock
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 0644 "$(service_file "$MT_HEALTH_UNIT")"
+  fi
 }
 
 render_mtproto_unit() {
@@ -1981,7 +2226,7 @@ start_pre() {
   ulimit -n 16384 2>/dev/null || true
 UNIT
     if [[ -x "$MT_PROTECT_SCRIPT" ]]; then
-      printf '  %s apply || true\n' "$MT_PROTECT_SCRIPT" >> "$(service_file "$MT_UNIT")"
+      printf '  %s apply || return 1\n' "$MT_PROTECT_SCRIPT" >> "$(service_file "$MT_UNIT")"
     fi
     printf '}\n' >> "$(service_file "$MT_UNIT")"
     chmod 0755 "$(service_file "$MT_UNIT")"
@@ -1996,7 +2241,7 @@ Type=simple
 Environment=GOMEMLIMIT=64MiB
 Environment=GOGC=75
 Environment=GOMAXPROCS=2
-$(if [[ -x "$MT_PROTECT_SCRIPT" ]]; then printf 'ExecStartPre=-%s apply\n' "$MT_PROTECT_SCRIPT"; fi)
+$(if [[ -x "$MT_PROTECT_SCRIPT" ]]; then printf 'ExecStartPre=%s apply\n' "$MT_PROTECT_SCRIPT"; fi)
 ExecStart=$(command -v setpriv) --reuid=$SERVICE_UID --regid=$SERVICE_GID --clear-groups --bounding-set=-all --no-new-privs $BIN_DIR/mtg run $ETC_DIR/mtproto.toml
 Restart=on-failure
 RestartSec=5
@@ -2029,6 +2274,8 @@ rollback_mtproto() {
   ((MT_TRANSACTION)) || return 0
   MT_TRANSACTION=0
   say 'MTProto 安装失败，正在恢复原配置。'
+  svc stop "$MT_HEALTH_UNIT" || true
+  if ((!MT_HEALTH_WAS_ENABLED)); then svc disable "$MT_HEALTH_UNIT" || true; fi
   svc stop "$MT_UNIT" || true
   if ((!MT_WAS_ENABLED)); then svc disable "$MT_UNIT" || true; fi
   if ((MT_SELINUX_ADDED)); then semanage fcontext -d "$BIN_DIR/mtg" || true; fi
@@ -2043,6 +2290,8 @@ rollback_mtproto() {
   svc reload || true
   if ((MT_WAS_ENABLED)); then svc enable "$MT_UNIT" || true; fi
   if ((MT_WAS_ACTIVE)); then svc start "$MT_UNIT" || true; fi
+  if ((MT_HEALTH_WAS_ENABLED)); then svc enable "$MT_HEALTH_UNIT" || true; fi
+  if ((MT_HEALTH_WAS_ACTIVE)); then svc start "$MT_HEALTH_UNIT" || true; fi
 }
 
 wait_mtproto() {
@@ -2063,6 +2312,20 @@ wait_mtproto() {
   return 1
 }
 
+show_mtproto_protection() {
+  local port=$1
+  if [[ ! -x "$MT_PROTECT_SCRIPT" ]]; then
+    say 'MTProto 新连接限速防护：未安装；可在 Telegram 代理菜单中安装。'
+  elif command -v iptables >/dev/null &&
+       iptables -C INPUT -p tcp --dport "$port" --syn -j PERSONAL_MTPROTO 2>/dev/null &&
+       iptables -C PERSONAL_MTPROTO -m limit --limit "$MT_PROTECT_RATE/second" --limit-burst "$MT_PROTECT_BURST" -j RETURN 2>/dev/null &&
+       iptables -C PERSONAL_MTPROTO -j DROP 2>/dev/null; then
+    say "MTProto 新连接限速防护：已启用（${MT_PROTECT_RATE}/秒，突发 $MT_PROTECT_BURST）。"
+  else
+    say 'MTProto 新连接限速防护：已安装但未生效或无法核实；请重新安装防护并查看错误。'
+  fi
+}
+
 show_mtproto() {
   [[ -r "$ETC_DIR/mtproto.json" ]] || die '请先运行 mtproto 安装 MTProto。'
   validate_mtproto_file "$ETC_DIR/mtproto.json"
@@ -2075,11 +2338,7 @@ show_mtproto() {
     "此入口为 MTProto 直连，不经过 CF；只代理 Telegram，无需用户名和密码。"
   ' "$ETC_DIR/mtproto.json"
   say "密钥保存在 $ETC_DIR/mtproto.json（仅 root 可读）；更新时保留。"
-  if [[ -x "$MT_PROTECT_SCRIPT" ]]; then
-    say "MTProto 新连接限速防护：已启用（${MT_PROTECT_RATE}/秒，突发 $MT_PROTECT_BURST）。"
-  else
-    say 'MTProto 新连接限速防护：未启用；可在菜单中选择“安装 / 配置 MTProto 防护”。'
-  fi
+  show_mtproto_protection "$(jq -r .port "$ETC_DIR/mtproto.json")"
 }
 
 tcp_overflow_counters() {
@@ -2100,9 +2359,10 @@ tcp_overflow_counters() {
 
 install_mtproto() {
   local file old_port=53528 old_public='' candidate port_owned=0
-  [[ -x "$BIN_DIR/sing-box" && -r "$ETC_DIR/sing-box.json" ]] || die '请先选择“安装与配置”，再新增 MTProto。'
+  [[ -x "$BIN_DIR/xray" && -r "$ETC_DIR/xray.json" ]] || die '请先选择“安装与更新”，再新增 MTProto。'
   command -v python3 >/dev/null && command -v ss >/dev/null && command -v tar >/dev/null || die 'Missing python3, ss or tar; run install/update first.'
   MT_FILES=("$BIN_DIR/mtg" "$ETC_DIR/mtproto.json" "$ETC_DIR/mtproto.toml" "$MT_PROTECT_SCRIPT"
+    "$BIN_DIR/mtproto-health.py" "$(service_file "$MT_HEALTH_UNIT")"
     "$ETC_DIR/mtproto-selinux-fcontext" "$(service_file "$MT_UNIT")")
   [[ ! -L $ETC_DIR && ! -L $BIN_DIR ]] || die 'Managed directories must not be symlinks.'
   for file in "${MT_FILES[@]}"; do [[ ! -L $file ]] || die "Managed file must not be a symlink: $file"; done
@@ -2121,8 +2381,8 @@ install_mtproto() {
     prompt_value MT_PUBLIC_PORT 'MTProto 公网 TCP 端口' "$MT_PUBLIC_PORT"
   fi
   validate_mtproto_ports "$MT_PORT" "$MT_PUBLIC_PORT"
-  if jq -e --argjson port "$MT_PORT" 'any(.inbounds[]; .type != "hysteria2" and .listen_port == $port)' "$ETC_DIR/sing-box.json" >/dev/null; then
-    die 'MTProto port conflicts with an existing sing-box listener.'
+  if jq -e --argjson port "$MT_PORT" 'any(.inbounds[]; .port == $port)' "$ETC_DIR/xray.json" >/dev/null; then
+    die 'MTProto port conflicts with an existing xray listener.'
   fi
   if [[ -f "$ETC_DIR/mtproto.json" && $MT_PORT == "$old_port" ]] && svc is-active "$MT_UNIT"; then port_owned=1; fi
   if ss -H -ltn "sport = :$MT_PORT" | grep -q . && (( !port_owned )); then
@@ -2143,8 +2403,11 @@ install_mtproto() {
   for file in "${MT_FILES[@]}"; do [[ ! -e $file ]] || cp -a --parents "$file" "$WORK_DIR/mt-backup"; done
   if svc is-active "$MT_UNIT"; then MT_WAS_ACTIVE=1; fi
   if service_enabled "$MT_UNIT"; then MT_WAS_ENABLED=1; fi
+  if svc is-active "$MT_HEALTH_UNIT"; then MT_HEALTH_WAS_ACTIVE=1; fi
+  if service_enabled "$MT_HEALTH_UNIT"; then MT_HEALTH_WAS_ENABLED=1; fi
   MT_TRANSACTION=1
   trap 'die "MTProto installation interrupted."' INT TERM
+  if [[ -f $(service_file "$MT_HEALTH_UNIT") ]]; then svc stop "$MT_HEALTH_UNIT"; fi
   if [[ -f $(service_file "$MT_UNIT") ]]; then svc stop "$MT_UNIT"; fi
   install -m 0755 "$WORK_DIR/mtg-stage/mtg" "$BIN_DIR/mtg"
   install -m 0600 "$candidate" "$ETC_DIR/mtproto.json"
@@ -2157,25 +2420,30 @@ install_mtproto() {
   fi
   mtproto_selinux
   render_mtproto_unit
+  render_mtproto_health
   svc reload
   restart_service "$MT_UNIT"
   wait_mtproto "$MT_PORT"
   svc enable "$MT_UNIT"
+  svc enable "$MT_HEALTH_UNIT"
+  restart_service "$MT_HEALTH_UNIT"
+  svc is-active "$MT_HEALTH_UNIT" || die 'MTProto 健康监控启动失败。'
   MT_TRANSACTION=0
   trap - INT TERM
   say 'MTProto 已启动并设置开机自启，本机监听检查通过；Telegram 外网连接请在手机上实测。'
+  say '自动健康检查已启用：每 60 秒检查，连续 3 次异常才重启，重启冷却 10 分钟；手动停止服务不会被自动拉起。'
   show_mtproto
 }
 
 ensure_iptables() {
-  command -v iptables >/dev/null && return 0
+  command -v iptables >/dev/null && command -v iptables-restore >/dev/null && return 0
   say '未找到 iptables，正在安装防护所需的软件包。'
   case $PACKAGE_MANAGER in
     apt) apt_install_packages iptables ;;
     dnf|yum) rpm_install iptables ;;
     apk) apk add --no-cache iptables ;;
   esac
-  command -v iptables >/dev/null || die '未找到 iptables，无法安装 MTProto 防护。'
+  command -v iptables >/dev/null && command -v iptables-restore >/dev/null || die '未找到 iptables / iptables-restore，无法安装 MTProto 防护。'
 }
 
 install_mtproto_protection() {
@@ -2354,7 +2622,7 @@ configure_time_sync() {
 show_status() {
   local domain unit mt_port queue queued max_queue counters overflow drops
   menu_overview
-  for unit in "$VPN_UNIT" "$CF_UNIT" "$SUB_UNIT" "$MT_UNIT"; do
+  for unit in "$VPN_UNIT" "$CF_UNIT" "$HY2_UNIT" "$SUB_UNIT" "$MT_UNIT" "$MT_HEALTH_UNIT"; do
     if [[ -f $(service_file "$unit") ]]; then
       printf '\n%s\n' "$unit"
       svc status "$unit" || true
@@ -2366,11 +2634,7 @@ show_status() {
     mt_port=$(jq -r .port "$ETC_DIR/mtproto.json")
     queue=$(ss -H -ltn "sport = :$mt_port" | awk 'NR == 1 { print $2 "/" $3 }')
     say "MTProto TCP $mt_port 监听队列：${queue:-未监听}"
-    if [[ -x "$MT_PROTECT_SCRIPT" ]]; then
-      say "MTProto 新连接限速防护：已启用（${MT_PROTECT_RATE}/秒，突发 $MT_PROTECT_BURST）。"
-    else
-      say 'MTProto 新连接限速防护：未启用。'
-    fi
+    show_mtproto_protection "$mt_port"
     if [[ $queue =~ ^([0-9]+)/([0-9]+)$ ]]; then
       queued=${BASH_REMATCH[1]}; max_queue=${BASH_REMATCH[2]}
       if ((max_queue > 0 && queued * 100 >= max_queue * 80)); then
@@ -2396,14 +2660,14 @@ show_status() {
 show_logs() {
   local file
   if [[ $INIT_SYSTEM == openrc ]]; then
-    for file in sing-box cloudflare subscription mtproto; do
+    for file in xray hy2 cloudflare subscription mtproto mtproto-health; do
       if [[ -r "$RUN_DIR/$file.log" ]]; then
         printf '\n--- %s ---\n' "$file"
         tail -n 60 "$RUN_DIR/$file.log"
       fi
     done
   else
-    journalctl -u "$VPN_UNIT" -u "$CF_UNIT" -u "$SUB_UNIT" -u "$MT_UNIT" -n 100 --no-pager
+    journalctl -u "$VPN_UNIT" -u "$CF_UNIT" -u "$HY2_UNIT" -u "$SUB_UNIT" -u "$MT_UNIT" -u "$MT_HEALTH_UNIT" -n 100 --no-pager
     # cloudflared redirects its application output to a separate, private log.
     if [[ -r "$RUN_DIR/cloudflare.log" ]]; then
       printf '\n--- cloudflared ---\n'
@@ -2414,18 +2678,21 @@ show_logs() {
 
 start_stack() {
   local mode=$1
-  [[ -x "$BIN_DIR/sing-box" && -r "$ETC_DIR/sing-box.json" ]] || die '请先执行 install 安装 sing-box。'
+  [[ -x "$BIN_DIR/xray" && -r "$ETC_DIR/xray.json" ]] || die '请先执行 install 安装 Xray。'
   make_workdir
-  "$BIN_DIR/sing-box" check -c "$ETC_DIR/sing-box.json"
+  "$BIN_DIR/xray" run -test -config "$ETC_DIR/xray.json"
   if [[ $mode == restart ]]; then
-    start_core || die 'sing-box 启动检查失败，请查看 logs。'
+    start_core || die 'Xray 启动检查失败，请查看 logs。'
+    if ((HY2_ENABLED)); then start_hy2 || die 'Hy2 启动失败，请查看 logs。'; fi
     restart_service "$SUB_UNIT"
     if [[ -f $(service_file "$MT_UNIT") ]]; then restart_service "$MT_UNIT"; fi
   else
     svc start "$VPN_UNIT" "$SUB_UNIT"
-    wait_core || die 'sing-box 启动检查失败，请查看 logs。'
+    wait_core || die 'Xray 启动检查失败，请查看 logs。'
+    if ((HY2_ENABLED)); then svc start "$HY2_UNIT"; wait_hy2 || die 'Hy2 启动检查失败，请查看 logs。'; fi
     if [[ -f $(service_file "$MT_UNIT") ]]; then svc start "$MT_UNIT"; fi
   fi
+  if [[ -f $(service_file "$MT_HEALTH_UNIT") ]]; then svc start "$MT_HEALTH_UNIT"; fi
   svc start "$CF_UNIT"
   wait_tunnel || die 'Cloudflare 隧道未就绪，请查看 logs。'
   wait_subscription || die '订阅检查失败，请查看 logs。'
@@ -2444,7 +2711,7 @@ main() {
   if [[ $command_name == help || $command_name == --help || $command_name == -h ]]; then usage; return; fi
   parse_options "$@"
   if [[ $command_name != install ]]; then
-    [[ -z $SERVER_ADDR && -z $REALITY_PORT && -z $PUBLIC_PORT && -z $WS_PORT && -z $METRICS_PORT && -z $REALITY_SNI && -z $TUNNEL_PROTOCOL && -z $SING_BOX_VERSION && -z $CF_VERSION && -z $HY2_PORT && -z $HY2_PUBLIC_PORT && -z $SUB_PORT && -z $SUB_PUBLIC_PORT && -z $HY2_REQUESTED && -z $NODE_COUNTRY ]] || die 'Server settings and versions may only be changed with install.'
+    [[ -z $SERVER_ADDR && -z $REALITY_PORT && -z $PUBLIC_PORT && -z $WS_PORT && -z $METRICS_PORT && -z $REALITY_SNI && -z $TUNNEL_PROTOCOL && -z $XRAY_VERSION && -z $HY2_VERSION && -z $CF_VERSION && -z $HY2_PORT && -z $HY2_PUBLIC_PORT && -z $SUB_PORT && -z $SUB_PUBLIC_PORT && -z $HY2_REQUESTED && -z $NODE_COUNTRY ]] || die 'Server settings and versions may only be changed with install.'
     [[ $command_name == set-entry || -z $CF_ENTRY ]] || die '--cf-entry is used with install or set-entry.'
   fi
   [[ $command_name == mtproto || ( -z $MT_PORT && -z $MT_PUBLIC_PORT ) ]] || die "MTProto port options may only be used with mtproto."
@@ -2464,7 +2731,7 @@ main() {
     uninstall) uninstall_stack ;;
     mtproto|mtproto-protect|mtproto-unprotect|mtproto-info|export|status|logs|start|restart|restart-tunnel|set-entry|stop)
       if [[ $command_name == mtproto || $command_name == mtproto-protect || $command_name == mtproto-unprotect || $command_name == mtproto-info ]]; then
-        [[ -r "$ETC_DIR/managed-by" ]] || die '请先选择“安装与配置”，完成后再安装 MTProto。'
+        [[ -r "$ETC_DIR/managed-by" ]] || die '请先选择“安装与更新”，完成后再安装 MTProto。'
       fi
       need_installation
       command -v jq >/dev/null || die 'jq is required.'
@@ -2498,8 +2765,9 @@ main() {
           export_nodes "$domain"
           say "CF 入口已更改为 $CF_ENTRY:443。请在客户端更新订阅后重新连接 CF 节点。" ;;
         stop)
+          if [[ -f $(service_file "$MT_HEALTH_UNIT") ]]; then svc stop "$MT_HEALTH_UNIT"; fi
           if [[ -f $(service_file "$MT_UNIT") ]]; then svc stop "$MT_UNIT"; fi
-          svc stop "$SUB_UNIT" "$CF_UNIT" "$VPN_UNIT"; say 'Stopped. Keys and files retained.' ;;
+          svc stop "$SUB_UNIT" "$HY2_UNIT" "$CF_UNIT" "$VPN_UNIT"; say 'Stopped. Keys and files retained.' ;;
       esac ;;
     *) die "Unknown command: $command_name (use help)." ;;
   esac
