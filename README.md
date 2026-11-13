@@ -24,7 +24,25 @@
 
 ## 开始使用
 
-下载本仓库的 [deploy-personal-vpn.sh](deploy-personal-vpn.sh)，上传到服务器，以 root 运行：
+仓库地址：[svendou/vless-2go](https://github.com/svendou/vless-2go)。以 root 登录服务器，确认已安装 `curl`，即可直接从 GitHub 下载脚本，无需安装 Git 或手动上传。
+
+**下载最新版脚本并打开中文菜单（推荐）：**
+
+```bash
+curl -fsSL --retry 3 https://raw.githubusercontent.com/svendou/vless-2go/main/deploy-personal-vpn.sh -o deploy-personal-vpn.sh && bash deploy-personal-vpn.sh
+```
+
+**下载并直接安装基础节点：** 将 `YOUR_PUBLIC_IP` 替换为服务器公网 IPv4 或域名。
+
+```bash
+curl -fsSL --retry 3 https://raw.githubusercontent.com/svendou/vless-2go/main/deploy-personal-vpn.sh -o deploy-personal-vpn.sh && bash deploy-personal-vpn.sh install --server YOUR_PUBLIC_IP
+```
+
+直接安装使用默认端口，首次安装默认启用 Hy2；TG 代理和连接防护需在基础安装完成后分别安装。NAT 服务器需增加下方“端口设置”中的公网映射参数。
+
+命令使用 `main` 分支的 Raw 原始文件地址；GitHub 的 `/blob/` 链接是网页，不能直接作为脚本执行。脚本会调用自身处理菜单操作，因此先保存到文件再运行。再次运行下载命令可获取仓库中的最新脚本；更新核心版本仍需选择菜单中的更新项或指定版本参数。
+
+也可下载 [deploy-personal-vpn.sh](deploy-personal-vpn.sh) 后上传到服务器。已有本地文件时直接运行：
 
 ```bash
 bash deploy-personal-vpn.sh
